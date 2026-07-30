@@ -90,12 +90,18 @@ type Conn struct {
 
 	reading               chan struct{}
 	handshakeRecv         chan recvHandshakeState
+	inboundPacketInject   chan addrPkt
 	cancelHandshaker      func()
 	cancelHandshakeReader func()
 
 	fsm *handshakeFSM
 
 	replayProtectionWindow uint
+
+	// Allows intercepting and rerouting outgoing handshake packets.
+	outboundHandshakePacketInterceptor func(packet []byte, end bool) bool
+	// Allows getting notified about incoming handshake packets.
+	inboundHandshakePacketNotifier func(packet []byte)
 
 	handshakeConfig *handshakeConfig
 }
@@ -258,11 +264,15 @@ func createConn(
 
 		reading:               make(chan struct{}, 1),
 		handshakeRecv:         make(chan recvHandshakeState),
+		inboundPacketInject:   make(chan addrPkt),
 		closed:                closer.NewCloser(),
 		cancelHandshaker:      func() {},
 		cancelHandshakeReader: func() {},
 
 		replayProtectionWindow: uint(replayProtectionWindow), //nolint:gosec // G115
+
+		outboundHandshakePacketInterceptor: config.outboundHandshakePacketInterceptor,
+		inboundHandshakePacketNotifier:     config.inboundHandshakePacketNotifier,
 
 		state: State{
 			isClient: isClient,
@@ -584,12 +594,43 @@ func (c *Conn) writePackets(ctx context.Context, pkts []*packet) error {
 	return nil
 }
 
+// writeHandshakePackets writes DTLS handshake packets. When an outbound
+// handshake packet interceptor is set (DTLS-in-STUN / SPED) it is offered each
+// packet and may consume it instead of sending it on the wire.
+//
+//nolint:cyclop
+func (c *Conn) writeHandshakePackets(ctx context.Context, pkts []*packet) error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	compactedRawPackets, rAddr, err := c.prepareRawPackets(pkts)
+	if err != nil {
+		return err
+	}
+
+	for idx, compactedRawPacket := range compactedRawPackets {
+		if c.outboundHandshakePacketInterceptor != nil {
+			if c.outboundHandshakePacketInterceptor(compactedRawPacket, idx == len(compactedRawPackets)-1) {
+				continue
+			}
+		}
+		if _, err = c.nextConn.WriteToContext(ctx, compactedRawPacket, rAddr); err != nil {
+			if errors.Is(err, context.Canceled) && c.isConnectionClosed() {
+				return ErrConnClosed
+			}
+
+			return netError(err)
+		}
+	}
+
+	return nil
+}
+
 func (c *Conn) prepareRawPackets(pkts []*packet) ([][]byte, net.Addr, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
 	var rawPackets [][]byte
-
 	for _, pkt := range pkts {
 		pktRawPackets, err := c.prepareRawPacket(pkt)
 		if err != nil {
@@ -598,6 +639,7 @@ func (c *Conn) prepareRawPackets(pkts []*packet) ([][]byte, net.Addr, error) {
 
 		rawPackets = append(rawPackets, pktRawPackets...)
 	}
+
 	if len(rawPackets) == 0 {
 		return nil, nil, nil
 	}
@@ -918,20 +960,61 @@ var poolReadBuffer = sync.Pool{ //nolint:gochecknoglobals
 	},
 }
 
-func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
-	bufptr, ok := poolReadBuffer.Get().(*[]byte)
-	if !ok {
-		return errFailedToAccessPoolReadBuffer
-	}
-	defer poolReadBuffer.Put(bufptr)
+func (c *Conn) InjectInboundPacket(p []byte, rAddr net.Addr) {
+	c.inboundPacketInject <- addrPkt{rAddr, p}
+}
 
-	b := *bufptr
-	i, rAddr, err := c.nextConn.ReadFromContext(ctx, b)
+func (c *Conn) nextPacket(ctx context.Context) ([]byte, net.Addr, error) {
+	type readResult struct {
+		data  []byte
+		rAddr net.Addr
+		err   error
+	}
+	readCh := make(chan readResult, 1)
+
+	go func() {
+		bufptr, ok := poolReadBuffer.Get().(*[]byte)
+		if !ok {
+			readCh <- readResult{err: errFailedToAccessPoolReadBuffer}
+
+			return
+		}
+		b := *bufptr
+
+		i, rAddr, err := c.nextConn.ReadFromContext(ctx, b)
+		if err != nil {
+			readCh <- readResult{err: err}
+			poolReadBuffer.Put(bufptr)
+
+			return
+		}
+
+		data := make([]byte, i)
+		copy(data, b[:i])
+		poolReadBuffer.Put(bufptr)
+
+		readCh <- readResult{
+			data:  data,
+			rAddr: rAddr,
+		}
+	}()
+	select {
+	case p := <-c.inboundPacketInject:
+		return p.data, p.rAddr, nil
+	case p := <-readCh:
+		return p.data, p.rAddr, p.err
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+}
+
+func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
+	data, rAddr, err := c.nextPacket(ctx)
 	if err != nil {
 		return netError(err)
 	}
 
-	pkts, err := recordlayer.ContentAwareUnpackDatagram(b[:i], len(c.state.getLocalConnectionID()))
+	pkts, err := recordlayer.ContentAwareUnpackDatagram(data, len(c.state.getLocalConnectionID()))
 	if err != nil {
 		return err
 	}
@@ -962,6 +1045,11 @@ func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
 		}
 	}
 	if hasHandshake {
+		if c.inboundHandshakePacketNotifier != nil {
+			// Would it be useful to know this was injected?
+			// Should this work on a copy?
+			c.inboundHandshakePacketNotifier(data)
+		}
 		s := recvHandshakeState{
 			done:         make(chan struct{}),
 			isRetransmit: isRetransmit,
@@ -969,7 +1057,7 @@ func (c *Conn) readAndBuffer(ctx context.Context) error { //nolint:cyclop
 		select {
 		case c.handshakeRecv <- s:
 			// If the other party may retransmit the flight,
-			// we should respond even if it not a new message.
+			// we should respond even if it is not a new message.
 			<-s.done
 		case <-c.fsm.Done():
 		}
