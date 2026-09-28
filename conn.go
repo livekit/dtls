@@ -962,7 +962,10 @@ var poolReadBuffer = sync.Pool{ //nolint:gochecknoglobals
 }
 
 func (c *Conn) InjectInboundPacket(p []byte, rAddr net.Addr) {
-	c.inboundPacketInject <- addrPkt{rAddr, p}
+	select {
+	case <-c.closed.Done():
+	case c.inboundPacketInject <- addrPkt{rAddr, p}:
+	}
 }
 
 type readResult struct {
