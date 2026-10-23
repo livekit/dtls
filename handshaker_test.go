@@ -462,7 +462,7 @@ func (c *flightTestConn) notify(context.Context, alert.Level, alert.Description)
 	return nil
 }
 
-func (c *flightTestConn) writePackets(_ context.Context, pkts []*packet) error { //nolint:cyclop
+func (c *flightTestConn) writeHandshakePackets(_ context.Context, pkts []*packet) error { //nolint:cyclop
 	time.Sleep(c.delay)
 	isRetransmit := false
 	isClientHello := false
