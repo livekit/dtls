@@ -3,6 +3,12 @@
 
 package handshake
 
+import (
+	"bytes"
+
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+)
+
 // MessageFinished is a DTLS Handshake Message
 // this message is the first one protected with the just
 // negotiated algorithms, keys, and secrets.  Recipients of Finished
@@ -18,14 +24,32 @@ func (m MessageFinished) Type() Type {
 	return TypeFinished
 }
 
+// MarshalSize returns the size required for MarshalTo.
+func (m *MessageFinished) MarshalSize() int {
+	return len(m.VerifyData)
+}
+
 // Marshal encodes the Handshake.
 func (m *MessageFinished) Marshal() ([]byte, error) {
-	return append([]byte{}, m.VerifyData...), nil
+	out := make([]byte, m.MarshalSize())
+	_, err := m.MarshalTo(out)
+
+	return out, err
+}
+
+// MarshalTo encodes the Handshake into a pre-allocated buffer.
+func (m *MessageFinished) MarshalTo(out []byte) (int, error) {
+	if len(out) < m.MarshalSize() {
+		return 0, dtlserrors.ErrBufferTooSmall
+	}
+	copy(out, m.VerifyData)
+
+	return m.MarshalSize(), nil
 }
 
 // Unmarshal populates the message from encoded data.
 func (m *MessageFinished) Unmarshal(data []byte) error {
-	m.VerifyData = append([]byte{}, data...)
+	m.VerifyData = bytes.Clone(data)
 
 	return nil
 }

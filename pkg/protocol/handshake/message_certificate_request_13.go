@@ -4,10 +4,11 @@
 package handshake
 
 import (
+	"bytes"
 	"encoding/binary"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/pkg/protocol/extension"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/pkg/protocol/extension"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -22,7 +23,7 @@ type MessageCertificateRequest13 struct {
 
 	// Extensions contains the list of extensions.
 	// The signature_algorithms extension is REQUIRED per RFC 8446.
-	Extensions []extension.Extension
+	Extensions []extension.Value
 }
 
 // Type returns the handshake message type.
@@ -42,46 +43,78 @@ const (
 //
 //	[1 byte]  certificate_request_context length
 //	[0-255]   certificate_request_context data
-//	[2 bytes] extensions length (from extension.Marshal)
+//	[2 bytes] extensions length (from extension.MarshalList)
 //	[variable] extensions data
 func (m *MessageCertificateRequest13) Marshal() ([]byte, error) {
+	extensions, marshalSize, err := m.prepareMarshal()
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, marshalSize)
+	m.marshalTo(out, extensions)
+
+	return out, nil
+}
+
+// MarshalSize returns the size needed for MarshalTo.
+func (m *MessageCertificateRequest13) MarshalSize() int {
+	return 1 + len(m.CertificateRequestContext) + extension.MarshalListSize(m.Extensions)
+}
+
+// MarshalTo encodes like Marshal but in a pre-allocate buffer.
+func (m *MessageCertificateRequest13) MarshalTo(out []byte) (int, error) {
+	extensions, marshalSize, err := m.prepareMarshal()
+	if err != nil {
+		return 0, err
+	}
+	if len(out) < marshalSize {
+		return 0, dtlserrors.ErrBufferTooSmall
+	}
+
+	m.marshalTo(out, extensions)
+
+	return marshalSize, nil
+}
+
+func (m *MessageCertificateRequest13) prepareMarshal() ([]byte, int, error) {
 	// Validate certificate_request_context length
 	if len(m.CertificateRequestContext) > certReq13ContextMaxLength {
-		return nil, dtlserrors.ErrCertificateRequestContextTooLong
+		return nil, 0, dtlserrors.ErrCertificateRequestContextTooLong
 	}
 
 	// Validate that signature_algorithms extension is present (required by RFC 8446)
 	hasSignatureAlgorithms := false
 	for _, ext := range m.Extensions {
-		if ext.TypeValue() == extension.SupportedSignatureAlgorithmsTypeValue {
+		if ext.ExtensionType() == extension.TypeSignatureAlgorithms {
 			hasSignatureAlgorithms = true
 
 			break
 		}
 	}
 	if !hasSignatureAlgorithms {
-		return nil, dtlserrors.ErrMissingSignatureAlgorithmsExtension
+		return nil, 0, dtlserrors.ErrMissingSignatureAlgorithmsExtension
 	}
 
-	var builder cryptobyte.Builder
-
-	// Add certificate_request_context (1-byte length prefix)
-	builder.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
-		b.AddBytes(m.CertificateRequestContext)
-	})
-
-	// Marshal extensions (includes 2-byte length prefix, like in TLS 1.2)
-	extensionsData, err := extension.Marshal(m.Extensions)
+	extensions, err := extension.MarshalList(m.Extensions)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	// Validate extensions length is in valid range <2..2^16-1>
-	if len(extensionsData) < 2 || len(extensionsData) > maxUint16 {
-		return nil, dtlserrors.ErrInvalidExtensionsLength
+	if len(extensions) < 2 || len(extensions) > maxUint16 {
+		return nil, 0, dtlserrors.ErrInvalidExtensionsLength
 	}
-	builder.AddBytes(extensionsData)
 
-	return builder.Bytes()
+	marshalSize := 1 + len(m.CertificateRequestContext) + len(extensions)
+
+	return extensions, marshalSize, nil
+}
+
+func (m *MessageCertificateRequest13) marshalTo(out, extensions []byte) {
+	n := 0
+	out[0] = byte(len(m.CertificateRequestContext)) //nolint:gosec // G115
+	n += 1
+	n += copy(out[1:], m.CertificateRequestContext)
+	copy(out[n:], extensions)
 }
 
 // Unmarshal decodes the MessageCertificateRequest13 from its wire format.
@@ -98,8 +131,7 @@ func (m *MessageCertificateRequest13) Unmarshal(data []byte) error {
 	if !str.ReadUint8LengthPrefixed(&contextData) {
 		return dtlserrors.ErrInvalidCertificateRequestContext
 	}
-	m.CertificateRequestContext = make([]byte, len(contextData))
-	copy(m.CertificateRequestContext, contextData)
+	m.CertificateRequestContext = bytes.Clone(contextData)
 
 	// Read extensions length (2 bytes)
 	if len(str) < 2 {
@@ -112,16 +144,17 @@ func (m *MessageCertificateRequest13) Unmarshal(data []byte) error {
 		return dtlserrors.ErrLengthMismatch
 	}
 
-	var err error
-	m.Extensions, err = extension.Unmarshal([]byte(str))
+	extensions, err := decodeExtensionList([]byte(str), extensionContextCertificateRequest)
 	if err != nil {
 		return err
 	}
 
+	m.Extensions = extensions
+
 	// Validate that signature_algorithms extension is present (required by RFC 8446)
 	hasSignatureAlgorithms := false
 	for _, ext := range m.Extensions {
-		if ext.TypeValue() == extension.SupportedSignatureAlgorithmsTypeValue {
+		if ext.ExtensionType() == extension.TypeSignatureAlgorithms {
 			hasSignatureAlgorithms = true
 
 			break

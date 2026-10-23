@@ -10,8 +10,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/examples/util"
+	"github.com/pion/dtls/v4"
+	"github.com/pion/dtls/v4/examples/util"
+	"github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
 )
 
 func main() {
@@ -22,16 +23,15 @@ func main() {
 	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
 	//
 
-	listener, err := dtls.ListenWithOptions("udp", addr,
-		dtls.WithPSK(func(hint []byte) ([]byte, error) {
-			fmt.Printf("Client's hint: %s \n", hint)
+	listener, err := dtls.ListenAddr("udp", addr,
+		dtls.WithPSK(nil, func(identities [][]byte) (*dtls.PSK, error) {
+			fmt.Printf("Client's identity: %s \n", identities[0])
 
-			return []byte{0xAB, 0xC1, 0x23}, nil
+			return &dtls.PSK{Identity: identities[0], Key: []byte{0xAB, 0xC1, 0x23}}, nil
 		}),
-		dtls.WithPSKIdentityHint([]byte("Pion DTLS Server")),
-		dtls.WithCipherSuites(dtls.TLS_PSK_WITH_AES_128_CCM_8),
+		dtls.WithCipherSuites(ciphersuite.TLS_PSK_WITH_AES_128_CCM_8),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
-		dtls.WithConnectionIDGenerator(dtls.RandomCIDGenerator(8)),
+		dtls.WithConnectionID(dtls.RandomCIDGenerator(8), dtls.CIDPathMigrationUnsafe),
 	)
 	util.Check(err)
 	defer func() {

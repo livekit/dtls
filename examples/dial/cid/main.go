@@ -10,8 +10,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/examples/util"
+	"github.com/pion/dtls/v4"
+	"github.com/pion/dtls/v4/examples/util"
+	"github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
 )
 
 func main() {
@@ -25,16 +26,13 @@ func main() {
 	// Connect to a DTLS server
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	dtlsConn, err := dtls.DialWithOptions("udp", addr,
-		dtls.WithPSK(func(hint []byte) ([]byte, error) {
-			fmt.Printf("Server's hint: %s \n", hint)
-
-			return []byte{0xAB, 0xC1, 0x23}, nil
-		}),
-		dtls.WithPSKIdentityHint([]byte("Pion DTLS Client")),
-		dtls.WithCipherSuites(dtls.TLS_PSK_WITH_AES_128_CCM_8),
+	dtlsConn, err := dtls.Dial("udp", addr,
+		dtls.WithPSK(func() ([]dtls.PSK, error) {
+			return []dtls.PSK{{Identity: []byte("Pion DTLS Client"), Key: []byte{0xAB, 0xC1, 0x23}}}, nil
+		}, nil),
+		dtls.WithCipherSuites(ciphersuite.TLS_PSK_WITH_AES_128_CCM_8),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
-		dtls.WithConnectionIDGenerator(dtls.OnlySendCIDGenerator()),
+		dtls.WithConnectionID(dtls.OnlySendCIDGenerator(), dtls.CIDPathMigrationUnsafe),
 	)
 	util.Check(err)
 	defer func() {

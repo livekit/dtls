@@ -10,9 +10,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/examples/util"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	"github.com/pion/dtls/v4"
+	"github.com/pion/dtls/v4/examples/util"
+	"github.com/pion/dtls/v4/pkg/crypto/selfsign"
 )
 
 func main() {
@@ -30,7 +30,7 @@ func main() {
 	// Connect to a DTLS server
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	dtlsConn, err := dtls.DialWithOptions("udp", addr,
+	dtlsConn, err := dtls.Dial("udp", addr,
 		dtls.WithCertificates(certificate),
 		dtls.WithInsecureSkipVerify(true),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),

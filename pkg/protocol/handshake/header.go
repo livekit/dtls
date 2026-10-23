@@ -6,8 +6,8 @@ package handshake
 import (
 	"encoding/binary"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/internal/util"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/internal/util"
 )
 
 // HeaderLength msg_len for Handshake messages assumes an extra
@@ -30,6 +30,16 @@ type Header struct {
 // Marshal encodes the Header.
 func (h *Header) Marshal() ([]byte, error) {
 	out := make([]byte, HeaderLength)
+	_, err := h.MarshalTo(out)
+
+	return out, err
+}
+
+// MarshalTo encodes the Header using a pre-allocated buffer.
+func (h *Header) MarshalTo(out []byte) (int, error) {
+	if len(out) < HeaderLength {
+		return 0, dtlserrors.ErrBufferTooSmall
+	}
 
 	out[0] = byte(h.Type)
 	util.PutBigEndianUint24(out[1:], h.Length)
@@ -37,7 +47,7 @@ func (h *Header) Marshal() ([]byte, error) {
 	util.PutBigEndianUint24(out[6:], h.FragmentOffset)
 	util.PutBigEndianUint24(out[9:], h.FragmentLength)
 
-	return out, nil
+	return HeaderLength, nil
 }
 
 // Unmarshal populates the header from encoded data.

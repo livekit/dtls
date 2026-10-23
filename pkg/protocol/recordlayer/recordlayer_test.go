@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/pion/dtls/v3/pkg/protocol"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/internal/recordwire"
+	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,211 +21,71 @@ func TestUDPDecode(t *testing.T) {
 		Want      [][]byte
 		WantError error
 	}{
-		{
-			Name: "Change Cipher Spec, single packet",
-			Data: []byte{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01},
-			Want: [][]byte{
-				{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01},
-			},
-		},
+		{Name: "Change Cipher Spec, single packet", Data: []byte{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01}, Want: [][]byte{{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01}}},
 		{
 			Name: "Change Cipher Spec, multi packet",
-			Data: []byte{
-				0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01,
-				0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x01, 0x01,
-			},
-			Want: [][]byte{
-				{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01},
-				{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x01, 0x01},
-			},
+			Data: []byte{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01, 0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x01, 0x01},
+			Want: [][]byte{{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01}, {0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x01, 0x01}},
 		},
 		{
 			Name:      "Invalid packet length",
 			Data:      []byte{0x14, 0xfe},
 			WantError: ErrInvalidPacketLength,
 		},
-		{
-			Name:      "Packet declared invalid length",
-			Data:      []byte{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0xFF, 0x01},
-			WantError: ErrInvalidPacketLength,
-		},
+		{Name: "Packet declared invalid length", Data: []byte{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0xFF, 0x01}, WantError: ErrInvalidPacketLength},
 	} {
-		dtlsPkts, err := UnpackDatagram(test.Data)
+		dtlsPkts, err := UnpackDatagram(test.Data, UnpackDatagramConfig{})
 		assert.ErrorIs(t, err, test.WantError)
 		assert.Equal(t, test.Want, dtlsPkts, "UDP decode: %s", test.Name)
 	}
 }
 
-func TestRecordLayerRoundTrip(t *testing.T) {
-	for _, test := range []struct {
-		Name               string
-		Data               []byte
-		Want               *RecordLayer
-		WantMarshalError   error
-		WantUnmarshalError error
-	}{
-		{
-			Name: "Change Cipher Spec, single packet",
-			Data: []byte{0x14, 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01},
-			Want: &RecordLayer{
-				Header: Header{
-					ContentType:    protocol.ContentTypeChangeCipherSpec,
-					ContentLen:     1,
-					Version:        protocol.Version1_2,
-					Epoch:          0,
-					SequenceNumber: 18,
-				},
-				Content: &protocol.ChangeCipherSpec{},
-			},
-		},
-	} {
-		r := &RecordLayer{}
-		assert.ErrorIs(t, r.Unmarshal(test.Data), test.WantUnmarshalError)
-		assert.Equal(t, test.Want, r, "RecordLayer should match expected value after unmarshal")
+func TestUnpackDatagramMixedFixedRecords(t *testing.T) {
+	ordinaryFirst := []byte{byte(protocol.ContentTypeApplicationData), 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0xa1}
+	cidRecord := []byte{byte(protocol.ContentTypeConnectionID), 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xca, 0xfe, 0x00, 0x01, 0xb2}
+	ordinaryLast := []byte{byte(protocol.ContentTypeAlert), 0xfe, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0xc3}
+	datagram := append([]byte{}, ordinaryFirst...)
+	datagram = append(datagram, cidRecord...)
+	datagram = append(datagram, ordinaryLast...)
 
-		data, marshalErr := r.Marshal()
-		assert.ErrorIs(t, marshalErr, test.WantMarshalError)
-		assert.Equal(t, test.Data, data, "RecordLayer should match expected value after marshal")
-	}
+	records, err := UnpackDatagram(datagram, UnpackDatagramConfig{CIDLength: 2})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{ordinaryFirst, cidRecord, ordinaryLast}, records)
+	records[0][FixedHeaderSize] = 0xd4
+	require.Equal(t, byte(0xd4), datagram[FixedHeaderSize])
+
+	truncated := datagram[:len(datagram)-1]
+	records, err = UnpackDatagram(truncated, UnpackDatagramConfig{CIDLength: 2})
+	require.ErrorIs(t, err, ErrInvalidPacketLength)
+	require.Len(t, records, 2)
+	prefix := append([]byte{}, records[0]...)
+	prefix = append(prefix, records[1]...)
+	require.Equal(t, datagram[:len(ordinaryFirst)+len(cidRecord)], prefix)
 }
 
-func FuzzRecordLayer_Unmarshal_No_Panics(f *testing.F) {
-	f.Add([]byte{
-		0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01,
-	})
-
-	f.Fuzz(func(_ *testing.T, data []byte) {
-		var r RecordLayer
-		_ = r.Unmarshal(data)
-	})
+func TestUnpackDatagramRejectsInvalidCIDLength(t *testing.T) {
+	for _, cidLength := range []int{-1, maxConnectionIDLength + 1} {
+		records, err := UnpackDatagram(nil, UnpackDatagramConfig{CIDLength: cidLength})
+		require.ErrorIs(t, err, ErrInvalidPacketLength)
+		require.Nil(t, records)
+	}
 }
 
 func FuzzUnpackDatagram_No_Panics(f *testing.F) {
 	Datasingle := []byte{
 		0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01,
 	}
-	Datamulti := []byte{
-		0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01,
-		0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x01, 0x01,
-	}
-	f.Add(Datasingle)
-	f.Add(Datamulti)
+	Datamulti := []byte{0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x01, 0x01, 0x14, 0xfe, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00, 0x01, 0x01}
+	f.Add(Datasingle, uint8(0))
+	f.Add(Datamulti, uint8(0))
+	f.Add(append([]byte{recordwire.UnifiedFixedBits, 0x01}, make([]byte, minDTLSCiphertextRecordLen)...), uint8(0))
 
-	f.Fuzz(func(_ *testing.T, data []byte) {
-		_, _ = UnpackDatagram(data)
+	f.Fuzz(func(_ *testing.T, data []byte, cidLength uint8) {
+		_, _ = UnpackDatagram(data, UnpackDatagramConfig{CIDLength: int(cidLength)})
 	})
 }
 
-func FuzzRecordLayer_MarshalUnmarshal_RoundTrip(f *testing.F) {
-	f.Add([]byte{}, uint16(0), uint64(0))
-	f.Add([]byte{1, 2, 3}, uint16(1), uint64(5))
-
-	f.Fuzz(func(t *testing.T, payload []byte, epoch uint16, seq uint64) {
-		if len(payload) > 1<<14 {
-			payload = payload[:1<<14]
-		}
-
-		recordLayer := &RecordLayer{
-			Header: Header{
-				ContentType:    protocol.ContentTypeApplicationData,
-				Version:        protocol.Version1_2,
-				Epoch:          epoch,
-				SequenceNumber: seq,
-			},
-			Content: &protocol.ApplicationData{Data: payload},
-		}
-
-		raw, err := recordLayer.Marshal()
-		require.NoError(t, err)
-
-		var back RecordLayer
-		require.NoError(t, back.Unmarshal(raw))
-
-		require.Equal(t, recordLayer.Header.ContentType, back.Header.ContentType)
-		require.Equal(t, recordLayer.Header.Version, back.Header.Version)
-		require.Equal(t, recordLayer.Header.Epoch, back.Header.Epoch)
-		require.Equal(t, recordLayer.Header.SequenceNumber, back.Header.SequenceNumber)
-
-		bodyLen := len(raw) - back.Header.Size()
-		appData, ok := back.Content.(*protocol.ApplicationData)
-		require.True(t, ok)
-		require.Equal(t, bodyLen, len(appData.Data))
-
-		require.Equal(t, payload, appData.Data)
-
-		raw2, err := back.Marshal()
-		require.NoError(t, err)
-		require.Equal(t, raw, raw2)
-	})
-}
-
-func FuzzRecordLayer_UnpackDatagram_RoundTrip(f *testing.F) {
-	f.Add(uint8(1), []byte("a"), []byte{}, []byte{}, []byte{})
-	f.Add(uint8(3), []byte("one"), []byte("two"), []byte("three"), []byte(""))
-
-	f.Fuzz(func(t *testing.T, n uint8, p1, p2, p3, p4 []byte) {
-		count := int(n%4) + 1
-		all := [][]byte{p1, p2, p3, p4}
-		all = all[:count]
-
-		for i := range all {
-			if len(all[i]) > 1<<14 {
-				all[i] = all[i][:1<<14] //nolint:gosec // i is bounded by range over all slice
-			}
-			if len(all[i]) == 0 { //nolint:gosec // i is bounded by range over all slice
-				all[i] = []byte{0} // ensure a non-empty record
-			}
-		}
-
-		var dat []byte
-		want := make([][]byte, 0, count)
-		for i := range count {
-			rl := &RecordLayer{
-				Header: Header{
-					ContentType:    protocol.ContentTypeApplicationData,
-					Version:        protocol.Version1_2,
-					Epoch:          uint16(i),                //nolint:gosec // G115: i is bounded (<= 4)
-					SequenceNumber: uint64(1000) + uint64(i), //nolint:gosec // G115: i is bounded (<= 4)
-				},
-				Content: &protocol.ApplicationData{Data: all[i]}, //nolint:gosec // no out of range access.
-			}
-			raw, err := rl.Marshal()
-			require.NoError(t, err)
-			dat = append(dat, raw...)
-			want = append(want, raw)
-		}
-
-		chunks, err := UnpackDatagram(dat)
-		require.NoError(t, err)
-		require.Equal(t, len(want), len(chunks))
-
-		for i := range chunks {
-			require.Equal(t, want[i], chunks[i])
-
-			require.True(t, len(chunks[i]) >= FixedHeaderSize+1)
-			ln := int(binary.BigEndian.Uint16(chunks[i][11:]))
-			require.Equal(t, ln, len(chunks[i])-FixedHeaderSize)
-
-			var rl RecordLayer
-			require.NoError(t, rl.Unmarshal(chunks[i]))
-		}
-
-		if len(dat) >= FixedHeaderSize+2 {
-			bad := append([]byte{}, dat...)
-			orig := binary.BigEndian.Uint16(bad[11:])
-			binary.BigEndian.PutUint16(bad[11:], orig+1)
-			_, err = UnpackDatagram(bad)
-			require.ErrorIs(t, err, ErrInvalidPacketLength)
-		}
-
-		if len(dat) > 0 {
-			_, err = UnpackDatagram(dat[:len(dat)-1])
-			require.ErrorIs(t, err, ErrInvalidPacketLength)
-		}
-	})
-}
-
-func FuzzRecordLayer_ContentAwareUnpackDatagram_RoundTrip(f *testing.F) {
+func FuzzRecordLayer_UnpackDatagramCID_RoundTrip(f *testing.F) {
 	f.Add(uint8(5), []byte("hello"), []byte("world"))
 	f.Add(uint8(0), []byte{}, []byte("x"))
 
@@ -255,7 +117,7 @@ func FuzzRecordLayer_ContentAwareUnpackDatagram_RoundTrip(f *testing.F) {
 				header[0] = byte(protocol.ContentTypeApplicationData)
 			}
 
-			header[1], header[2] = protocol.Version1_2.Major, protocol.Version1_2.Minor
+			header[1], header[2] = protocol.Version1_2.Major(), protocol.Version1_2.Minor()
 			binary.BigEndian.PutUint16(header[3:], epoch)
 
 			// 48-bit sequence number
@@ -285,7 +147,7 @@ func FuzzRecordLayer_ContentAwareUnpackDatagram_RoundTrip(f *testing.F) {
 		raw2 := makeCIDRecord(1, 11, p2)
 		data := append(append([]byte{}, raw1...), raw2...)
 
-		parts, err := ContentAwareUnpackDatagram(data, cl)
+		parts, err := UnpackDatagram(data, UnpackDatagramConfig{CIDLength: cl})
 		require.NoError(t, err)
 		require.Equal(t, 2, len(parts))
 		require.Equal(t, raw1, parts[0])
@@ -300,7 +162,7 @@ func FuzzRecordLayer_ContentAwareUnpackDatagram_RoundTrip(f *testing.F) {
 
 			require.GreaterOrEqual(t, len(part), FixedHeaderSize+hdrExtra)
 
-			lenIdx := fixedHeaderLenIdx + hdrExtra
+			lenIdx := FixedHeaderSize - 2 + hdrExtra
 			require.GreaterOrEqual(t, len(part), lenIdx+2)
 
 			decl := int(binary.BigEndian.Uint16(part[lenIdx:]))
@@ -314,17 +176,322 @@ func FuzzRecordLayer_ContentAwareUnpackDatagram_RoundTrip(f *testing.F) {
 			if protocol.ContentType(bad[0]) == protocol.ContentTypeConnectionID {
 				hdrExtra = cl
 			}
-			lenIdx := fixedHeaderLenIdx + hdrExtra
-			orig := binary.BigEndian.Uint16(bad[lenIdx:])
-			binary.BigEndian.PutUint16(bad[lenIdx:], orig+1)
-			_, err = ContentAwareUnpackDatagram(bad, cl)
+			lenIdx := FixedHeaderSize - 2 + hdrExtra
+			//nolint:gosec // The fuzz inputs are bounded
+			binary.BigEndian.PutUint16(bad[lenIdx:], uint16(len(bad)))
+			_, err = UnpackDatagram(bad, UnpackDatagramConfig{CIDLength: cl})
 			require.ErrorIs(t, err, ErrInvalidPacketLength)
 		}
 
 		// Negative: truncate the datagram.
 		if len(data) > 0 {
-			_, err = ContentAwareUnpackDatagram(data[:len(data)-1], cl)
+			_, err = UnpackDatagram(data[:len(data)-1], UnpackDatagramConfig{CIDLength: cl})
 			require.ErrorIs(t, err, ErrInvalidPacketLength)
 		}
 	})
+}
+
+func ciphertext13Payload(seed byte) []byte {
+	out := make([]byte, minDTLSCiphertextRecordLen)
+	for i := range out {
+		out[i] = seed + byte(i)
+	}
+
+	return out
+}
+
+func TestUnpackDatagramCiphertext13(t *testing.T) {
+	encryptedRecord := ciphertext13Payload(0xaa)
+	ciphertextWithLengthRaw, err := MarshalCiphertext(CiphertextConfig{SequenceNumber: 1, TwoByteSequence: true, LengthPresent: true}, encryptedRecord)
+	require.NoError(t, err)
+
+	ciphertextWithoutLengthRaw := append([]byte{0x20, 0x02}, ciphertext13Payload(0xcc)...)
+
+	datagram := append(append([]byte{}, ciphertextWithLengthRaw...), ciphertextWithoutLengthRaw...)
+	records, err := UnpackDatagram(datagram, UnpackDatagramConfig{})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{ciphertextWithLengthRaw, ciphertextWithoutLengthRaw}, records)
+}
+
+func TestUnpackDatagramRejectsShortFinalCiphertextRecordWithoutLength(t *testing.T) {
+	for recordLen := range minDTLSCiphertextRecordLen {
+		raw := append([]byte{0x20, 0x01}, make([]byte, recordLen)...)
+
+		_, err := UnpackDatagram(raw, UnpackDatagramConfig{})
+		require.ErrorIs(t, err, ErrInvalidPacketLength, "record length %d", recordLen)
+	}
+}
+
+func TestUnpackDatagramRejectsShortCiphertextRecordWithLength(t *testing.T) {
+	for recordLen := range minDTLSCiphertextRecordLen {
+		raw := []byte{
+			0x2c, 0x00, 0x01,
+			byte(recordLen >> 8), byte(recordLen),
+		}
+		raw = append(raw, make([]byte, recordLen)...)
+
+		_, err := UnpackDatagram(raw, UnpackDatagramConfig{})
+		require.ErrorIs(t, err, ErrInvalidPacketLength, "record length %d", recordLen)
+	}
+}
+
+func TestUnpackDatagramAutoTargetAppliesCIDPolicyByRecordForm(t *testing.T) {
+	cid := []byte{0xca, 0xfe}
+	fixedEpochZero := fixedRecordForScannerTest(t, protocol.ContentTypeHandshake, 0, 0xa1)
+	cidlessUnified := unifiedRecordForScannerTest(t, nil, 1)
+	cidUnified := unifiedRecordForScannerTest(t, cid, 2)
+	config := UnpackDatagramConfig{
+		CIDLength:   len(cid),
+		CIDRequired: true,
+	}
+
+	records, err := UnpackDatagram(fixedEpochZero, config)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{fixedEpochZero}, records)
+
+	datagram := append(append(append([]byte{}, fixedEpochZero...), cidlessUnified...), cidUnified...)
+	records, err = UnpackDatagram(datagram, config)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{fixedEpochZero, cidlessUnified, cidUnified}, records)
+
+	withoutCID := append(append([]byte{}, fixedEpochZero...), cidlessUnified...)
+	records, err = UnpackDatagram(withoutCID, config)
+	require.ErrorIs(t, err, dtlserrors.ErrInvalidCiphertextHeader)
+	require.Nil(t, records)
+
+	fixedProtectedWithoutCID := fixedRecordForScannerTest(t, protocol.ContentTypeApplicationData, 1, 0xb2)
+	datagram = append(append([]byte{}, fixedProtectedWithoutCID...), cidUnified...)
+	records, err = UnpackDatagram(datagram, config)
+	require.ErrorIs(t, err, dtlserrors.ErrInvalidCiphertextHeader)
+	require.Nil(t, records)
+}
+
+func TestUnpackDatagramTargetVersion12RejectsUnified(t *testing.T) {
+	fixed := fixedRecordForScannerTest(t, protocol.ContentTypeAlert, 0, 0xa1)
+	unified := unifiedRecordForScannerTest(t, nil, 1)
+	datagram := append(append([]byte{}, fixed...), unified...)
+
+	records, err := UnpackDatagram(datagram, UnpackDatagramConfig{
+		TargetVersion: protocol.Version1_2,
+	})
+	require.Error(t, err)
+	require.Equal(t, [][]byte{fixed}, records)
+}
+
+func TestUnpackDatagramTargetVersion13FixedRecordPolicy(t *testing.T) {
+	alertRecord := fixedRecordForScannerTest(t, protocol.ContentTypeAlert, 0, 0xa1)
+	handshakeRecord := fixedRecordForScannerTest(t, protocol.ContentTypeHandshake, 0, 0xb2)
+	ackRecord := fixedRecordForScannerTest(t, protocol.ContentTypeACK, 0, 0xc3)
+	unified := unifiedRecordForScannerTest(t, nil, 1)
+	datagram := append(append(append(append([]byte{}, alertRecord...), handshakeRecord...), ackRecord...), unified...)
+
+	records, err := UnpackDatagram(datagram, UnpackDatagramConfig{
+		TargetVersion: protocol.Version1_3,
+	})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{alertRecord, handshakeRecord, ackRecord, unified}, records)
+
+	for _, test := range []struct {
+		name        string
+		contentType protocol.ContentType
+		epoch       uint16
+	}{
+		{name: "application data", contentType: protocol.ContentTypeApplicationData, epoch: 0},
+		{name: "nonzero plaintext epoch", contentType: protocol.ContentTypeAlert, epoch: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			disallowed := fixedRecordForScannerTest(t, test.contentType, test.epoch, 0xdd)
+			records, err := UnpackDatagram(disallowed, UnpackDatagramConfig{
+				TargetVersion: protocol.Version1_3,
+			})
+			require.Error(t, err)
+			require.Empty(t, records)
+		})
+	}
+}
+
+func TestUnpackDatagramRejectsUnsupportedTargetVersion(t *testing.T) {
+	record := fixedRecordForScannerTest(t, protocol.ContentTypeAlert, 0, 0xa1)
+
+	for _, target := range []protocol.Version{
+		protocol.Version1_0,
+		protocol.Version(0x0102),
+	} {
+		records, err := UnpackDatagram(record, UnpackDatagramConfig{TargetVersion: target})
+		require.ErrorIs(t, err, dtlserrors.ErrUnsupportedProtocolVersion)
+		require.Nil(t, records)
+	}
+}
+
+func TestUnpackDatagramRejectsRequiredCIDWithoutLength(t *testing.T) {
+	records, err := UnpackDatagram(nil, UnpackDatagramConfig{
+		TargetVersion: protocol.Version1_3,
+		CIDRequired:   true,
+	})
+	require.ErrorIs(t, err, ErrInvalidPacketLength)
+	require.Nil(t, records)
+}
+
+func TestUnpackDatagramVersion13RequiresCIDPerDatagram(t *testing.T) {
+	cid := []byte{0xca, 0xfe, 0xba, 0xbe}
+	fixed := fixedRecordForScannerTest(t, protocol.ContentTypeHandshake, 0, 0xa1)
+	cidless := unifiedRecordForScannerTest(t, nil, 1)
+	withCID := unifiedRecordForScannerTest(t, cid, 2)
+	config := UnpackDatagramConfig{
+		TargetVersion: protocol.Version1_3,
+		CIDLength:     len(cid),
+		CIDRequired:   true,
+	}
+
+	datagram := append(append(append([]byte{}, fixed...), cidless...), withCID...)
+	records, err := UnpackDatagram(datagram, config)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{fixed, cidless, withCID}, records)
+
+	datagramWithoutCID := append(append([]byte{}, fixed...), cidless...)
+	records, err = UnpackDatagram(datagramWithoutCID, config)
+	require.ErrorIs(t, err, dtlserrors.ErrInvalidCiphertextHeader)
+	require.Nil(t, records)
+
+	// DTLSPlaintext has no CID field. A peer may retransmit an epoch-zero
+	// handshake record after the local endpoint has committed the negotiated
+	// CID, so a plaintext-only datagram remains eligible.
+	records, err = UnpackDatagram(fixed, config)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{fixed}, records)
+}
+
+func TestUnpackDatagramVersion12RequiresCIDAfterEpochZero(t *testing.T) {
+	cid := []byte{0xca, 0xfe}
+	config := UnpackDatagramConfig{
+		TargetVersion: protocol.Version1_2,
+		CIDLength:     len(cid),
+		CIDRequired:   true,
+	}
+
+	protectedWithCID, err := MarshalRecord(RecordConfig{
+		ContentType: protocol.ContentTypeConnectionID, Version: protocol.Version1_2,
+		Epoch: 1, ConnectionID: cid,
+	}, []byte{0xc3})
+	require.NoError(t, err)
+
+	epochZero := fixedRecordForScannerTest(t, protocol.ContentTypeHandshake, 0, 0xa1)
+	datagram := append(append([]byte{}, epochZero...), protectedWithCID...)
+	records, err := UnpackDatagram(datagram, config)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{epochZero, protectedWithCID}, records)
+
+	protectedWithoutCID := fixedRecordForScannerTest(t, protocol.ContentTypeApplicationData, 1, 0xb2)
+	records, err = UnpackDatagram(protectedWithoutCID, config)
+	require.ErrorIs(t, err, dtlserrors.ErrInvalidCiphertextHeader)
+	require.Nil(t, records)
+
+	records, err = UnpackDatagram(epochZero, config)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{epochZero}, records)
+}
+
+func TestUnpackDatagramAllowsCIDLessUnifiedWithConfiguredCIDLength(t *testing.T) {
+	raw, err := MarshalCiphertext(CiphertextConfig{SequenceNumber: 1, TwoByteSequence: true, LengthPresent: true}, ciphertext13Payload(0xaa))
+	require.NoError(t, err)
+
+	records, err := UnpackDatagram(raw, UnpackDatagramConfig{CIDLength: 4})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{raw}, records)
+}
+
+func TestUnpackDatagramRejectsUnifiedCIDWithoutConfiguredLength(t *testing.T) {
+	raw, err := MarshalCiphertext(CiphertextConfig{ConnectionID: []byte{1, 2, 3, 4}, SequenceNumber: 1, TwoByteSequence: true, LengthPresent: true}, ciphertext13Payload(0xaa))
+	require.NoError(t, err)
+
+	_, err = UnpackDatagram(raw, UnpackDatagramConfig{})
+	require.ErrorIs(t, err, ErrInvalidPacketLength)
+}
+
+func TestUnpackDatagramRejectsTruncatedUnifiedCID(t *testing.T) {
+	_, err := UnpackDatagram([]byte{0x30, 0x01, 0x02}, UnpackDatagramConfig{CIDLength: 4})
+	require.ErrorIs(t, err, ErrInvalidPacketLength)
+}
+
+func TestUnpackDatagramDoesNotApplyCIDAssociationPolicy(t *testing.T) {
+	firstRaw, err := MarshalCiphertext(CiphertextConfig{ConnectionID: []byte{1, 2, 3, 4}, SequenceNumber: 1, TwoByteSequence: true, LengthPresent: true}, ciphertext13Payload(0xaa))
+	require.NoError(t, err)
+
+	secondRaw, err := MarshalCiphertext(CiphertextConfig{ConnectionID: []byte{4, 3, 2, 1}, SequenceNumber: 2, TwoByteSequence: true, LengthPresent: true}, ciphertext13Payload(0xba))
+	require.NoError(t, err)
+
+	records, err := UnpackDatagram(
+		append(append([]byte{}, firstRaw...), secondRaw...),
+		UnpackDatagramConfig{CIDLength: 4},
+	)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{firstRaw, secondRaw}, records)
+}
+
+func TestUnpackDatagramDoesNotApplyContentPolicy(t *testing.T) {
+	raw, err := MarshalRecord(RecordConfig{ContentType: protocol.ContentTypeApplicationData, Version: protocol.Version1_2}, []byte{0xaa})
+	require.NoError(t, err)
+
+	records, err := UnpackDatagram(raw, UnpackDatagramConfig{})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{raw}, records)
+}
+
+func TestUnpackDatagramAllRecordForms(t *testing.T) {
+	fixedRaw, err := MarshalRecord(RecordConfig{ContentType: protocol.ContentTypeAlert, Version: protocol.Version1_2}, []byte{1, 0})
+	require.NoError(t, err)
+
+	cid := []byte{0xca, 0xfe}
+	cidRaw, err := MarshalRecord(RecordConfig{
+		ContentType: protocol.ContentTypeConnectionID, Version: protocol.Version1_2,
+		Epoch: 1, SequenceNumber: 2, ConnectionID: cid,
+	}, []byte{0xb2})
+	require.NoError(t, err)
+
+	unifiedRaw, err := MarshalCiphertext(CiphertextConfig{ConnectionID: cid, SequenceNumber: 3, TwoByteSequence: true, LengthPresent: true}, ciphertext13Payload(0xc3))
+	require.NoError(t, err)
+
+	datagram := append(append(append([]byte{}, fixedRaw...), cidRaw...), unifiedRaw...)
+	records, err := UnpackDatagram(datagram, UnpackDatagramConfig{CIDLength: len(cid)})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{fixedRaw, cidRaw, unifiedRaw}, records)
+
+	records, err = UnpackDatagram(datagram, UnpackDatagramConfig{})
+	require.ErrorIs(t, err, ErrInvalidPacketLength)
+	require.Equal(t, [][]byte{fixedRaw}, records)
+
+	records, err = UnpackDatagram(
+		datagram[:len(datagram)-1],
+		UnpackDatagramConfig{CIDLength: len(cid)},
+	)
+	require.ErrorIs(t, err, ErrInvalidPacketLength)
+	require.Equal(t, [][]byte{fixedRaw, cidRaw}, records)
+}
+
+func TestUnpackDatagramOmittedUnifiedLengthConsumesRemainder(t *testing.T) {
+	omitted := append([]byte{recordwire.UnifiedFixedBits, 0x01}, ciphertext13Payload(0xaa)...)
+
+	following, err := MarshalRecord(RecordConfig{ContentType: protocol.ContentTypeApplicationData, Version: protocol.Version1_2}, []byte{0xbb})
+	require.NoError(t, err)
+
+	datagram := append(append([]byte{}, omitted...), following...)
+	records, err := UnpackDatagram(datagram, UnpackDatagramConfig{})
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{datagram}, records)
+}
+
+func fixedRecordForScannerTest(t *testing.T, contentType protocol.ContentType, epoch uint16, payload byte) []byte {
+	t.Helper()
+	raw, err := MarshalRecord(RecordConfig{ContentType: contentType, Version: protocol.Version1_2, Epoch: epoch}, []byte{payload})
+	require.NoError(t, err)
+
+	return raw
+}
+
+func unifiedRecordForScannerTest(t *testing.T, cid []byte, sequenceNumber uint8) []byte {
+	t.Helper()
+	raw, err := MarshalCiphertext(CiphertextConfig{ConnectionID: cid, SequenceNumber: uint16(sequenceNumber), TwoByteSequence: true, LengthPresent: true}, ciphertext13Payload(sequenceNumber))
+	require.NoError(t, err)
+
+	return raw
 }

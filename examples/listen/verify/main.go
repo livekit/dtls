@@ -11,8 +11,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/examples/util"
+	"github.com/pion/dtls/v4"
+	"github.com/pion/dtls/v4/examples/util"
 )
 
 func main() {
@@ -34,7 +34,7 @@ func main() {
 	util.Check(err)
 	certPool.AddCert(cert)
 
-	listener, err := dtls.ListenWithOptions("udp", addr,
+	listener, err := dtls.ListenAddr("udp", addr,
 		dtls.WithCertificates(certificate),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
 		dtls.WithClientAuth(dtls.RequireAndVerifyClientCert),

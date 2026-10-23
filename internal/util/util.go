@@ -5,6 +5,7 @@
 package util // nolint:revive
 
 import (
+	"bytes"
 	"encoding/binary"
 )
 
@@ -34,11 +35,29 @@ func PutBigEndianUint48(out []byte, in uint64) {
 	copy(out, tmp[2:])
 }
 
-// Max returns the larger value.
-func Max(a, b int) int {
-	if a > b {
-		return a
+// CloneByteSlices returns a deep copy of in, preserving nil.
+func CloneByteSlices(in [][]byte) [][]byte {
+	if in == nil {
+		return nil
 	}
 
-	return b
+	out := make([][]byte, len(in))
+	for i := range in {
+		out[i] = bytes.Clone(in[i])
+	}
+
+	return out
+}
+
+// SplitBytes splits bytes into chunks no larger than splitLen.
+func SplitBytes(bytes []byte, splitLen int) [][]byte {
+	splitBytes := make([][]byte, 0)
+	numBytes := len(bytes)
+	for i := 0; i < numBytes; i += splitLen {
+		j := min(i+splitLen, numBytes)
+
+		splitBytes = append(splitBytes, bytes[i:j])
+	}
+
+	return splitBytes
 }

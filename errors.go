@@ -11,16 +11,22 @@ import (
 	"net"
 	"os"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/pkg/protocol/alert"
+	"github.com/pion/dtls/v4/internal/ech"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	cryptosuite "github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
+	"github.com/pion/dtls/v4/pkg/protocol/alert"
 )
 
 // ErrConnClosed indicates that the connection is closed.
-var ErrConnClosed = dtlserrors.ErrConnClosed //nolint:gochecknoglobals
+var ErrConnClosed = dtlserrors.ErrConnClosed
+
+// ECHRejectionError reports authenticated ECH rejection and retry configurations
+// for a new connection. The rejected connection cannot carry application data.
+type ECHRejectionError = ech.RejectionError
 
 // errInvalidCipherSuite indicates an attempt at using an unsupported cipher suite.
 type invalidCipherSuiteError struct {
-	id CipherSuiteID
+	id cryptosuite.ID
 }
 
 func (e *invalidCipherSuiteError) Error() string {
@@ -71,7 +77,7 @@ func netError(err error) error {
 		se      *os.SyscallError
 	)
 
-	if errors.As(err, &opError) { //nolint:nestif
+	if errors.As(err, &opError) {
 		if errors.As(opError, &se) {
 			if isOpErrorTemporary(se) {
 				return temporaryNetworkError{err: err}

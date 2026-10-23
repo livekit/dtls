@@ -4,8 +4,10 @@
 package handshake
 
 import (
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/internal/util"
+	"bytes"
+
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/internal/util"
 )
 
 // MessageCertificate is a DTLS Handshake Message
@@ -25,33 +27,49 @@ const (
 	handshakeMessageCertificateLengthFieldSize = 3
 )
 
-// Marshal encodes the Handshake.
-func (m *MessageCertificate) Marshal() ([]byte, error) {
+// MarshalSize returns the minimal size required for MarshalTo.
+func (m *MessageCertificate) MarshalSize() int {
 	total := handshakeMessageCertificateLengthFieldSize
 
 	for _, cert := range m.Certificate {
 		total += handshakeMessageCertificateLengthFieldSize + len(cert)
 	}
 
-	out := make([]byte, total)
+	return total
+}
 
-	// Total Payload Size
+// Marshal encodes the Handshake.
+func (m *MessageCertificate) Marshal() ([]byte, error) {
+	out := make([]byte, m.MarshalSize())
+	_, err := m.MarshalTo(out)
+
+	return out, err
+}
+
+// MarshalTo encodes the Handshake into a pre-allocated buffer.
+func (m *MessageCertificate) MarshalTo(out []byte) (int, error) {
+	if len(out) < m.MarshalSize() {
+		return 0, dtlserrors.ErrBufferTooSmall
+	}
+	// Total Payload MarshalSize
 	//nolint:gosec // G115
-	util.PutBigEndianUint24(out, uint32(total-handshakeMessageCertificateLengthFieldSize))
+	util.PutBigEndianUint24(out, uint32(m.MarshalSize()-handshakeMessageCertificateLengthFieldSize))
 	offset := handshakeMessageCertificateLengthFieldSize
 
 	for _, cert := range m.Certificate {
 		// Certificate Length
+		if len(cert) == 0 {
+			return 0, dtlserrors.ErrLengthMismatch
+		}
 		//nolint:gosec // G115
 		util.PutBigEndianUint24(out[offset:], uint32(len(cert)))
 		offset += handshakeMessageCertificateLengthFieldSize
 
 		// Certificate body
-		copy(out[offset:], cert)
-		offset += len(cert)
+		offset += copy(out[offset:], cert)
 	}
 
-	return out, nil
+	return m.MarshalSize(), nil
 }
 
 // Unmarshal populates the message from encoded data.
@@ -60,22 +78,24 @@ func (m *MessageCertificate) Unmarshal(data []byte) error {
 		return dtlserrors.ErrBufferTooSmall
 	}
 
-	if certificateBodyLen := int(util.BigEndianUint24(
-		data,
-	)); certificateBodyLen+handshakeMessageCertificateLengthFieldSize != len(data) {
+	if certificateBodyLen := int(util.BigEndianUint24(data)); certificateBodyLen+handshakeMessageCertificateLengthFieldSize != len(data) {
 		return dtlserrors.ErrLengthMismatch
 	}
 
+	m.Certificate = nil
 	offset := handshakeMessageCertificateLengthFieldSize
 	for offset < len(data) {
+		if len(data)-offset < handshakeMessageCertificateLengthFieldSize {
+			return dtlserrors.ErrLengthMismatch
+		}
 		certificateLen := int(util.BigEndianUint24(data[offset:]))
 		offset += handshakeMessageCertificateLengthFieldSize
 
-		if offset+certificateLen > len(data) {
+		if certificateLen == 0 || offset+certificateLen > len(data) {
 			return dtlserrors.ErrLengthMismatch
 		}
 
-		m.Certificate = append(m.Certificate, append([]byte{}, data[offset:offset+certificateLen]...))
+		m.Certificate = append(m.Certificate, bytes.Clone(data[offset:offset+certificateLen]))
 		offset += certificateLen
 	}
 

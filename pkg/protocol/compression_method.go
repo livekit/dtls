@@ -3,7 +3,7 @@
 
 package protocol
 
-import dtlserrors "github.com/pion/dtls/v3/internal/errors"
+import dtlserrors "github.com/pion/dtls/v4/internal/errors"
 
 // CompressionMethodID is the ID for a CompressionMethod.
 type CompressionMethodID byte
@@ -26,7 +26,7 @@ func CompressionMethods() map[CompressionMethodID]*CompressionMethod {
 
 // DecodeCompressionMethods the given compression methods.
 func DecodeCompressionMethods(buf []byte) ([]*CompressionMethod, error) {
-	if len(buf) < 1 {
+	if len(buf) == 0 {
 		return nil, dtlserrors.ErrBufferTooSmall
 	}
 	compressionMethodsCount := int(buf[0])

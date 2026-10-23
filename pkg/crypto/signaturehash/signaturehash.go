@@ -12,9 +12,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/pkg/crypto/hash"
-	"github.com/pion/dtls/v3/pkg/crypto/signature"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/pkg/crypto/hash"
+	"github.com/pion/dtls/v4/pkg/crypto/signature"
+	"github.com/pion/dtls/v4/pkg/protocol"
 )
 
 // Algorithm is a signature/hash algorithm pairs which may be used in
@@ -64,14 +65,34 @@ func Algorithms() []Algorithm {
 	}
 }
 
-// SelectSignatureScheme returns most preferred and compatible scheme for DTLS <= 1.2.
-func SelectSignatureScheme(sigs []Algorithm, privateKey crypto.PrivateKey) (Algorithm, error) {
-	return selectSignatureScheme13(sigs, privateKey, false)
-}
+// SelectSignatureScheme returns the most preferred compatible scheme for version.
+func SelectSignatureScheme(sigs []Algorithm, privateKey crypto.PrivateKey, version protocol.Version) (Algorithm, error) {
+	signer, ok := privateKey.(crypto.Signer)
+	if !ok {
+		return Algorithm{}, dtlserrors.ErrInvalidPrivateKey
+	}
 
-// SelectSignatureScheme13 returns most preferred and compatible scheme for DTLS 1.3.
-func SelectSignatureScheme13(sigs []Algorithm, privateKey crypto.PrivateKey) (Algorithm, error) {
-	return selectSignatureScheme13(sigs, privateKey, true)
+	is13 := version == protocol.Version1_3
+	for _, ss := range sigs {
+		// RSA-PSS is only supported in DTLS 1.3.
+		if !is13 && ss.Signature.IsPSS() {
+			continue
+		}
+		// TLS 1.3 CertificateVerify signatures made with RSA keys must use
+		// RSASSA-PSS.
+		if is13 && ss.Signature == signature.RSA {
+			continue
+		}
+		// Skip schemes understood but not supported by pion/dtls.
+		if ss.Signature.IsUnsupported() {
+			continue
+		}
+		if ss.isCompatible(signer) {
+			return ss, nil
+		}
+	}
+
+	return Algorithm{}, dtlserrors.ErrNoAvailableSignatureSchemes
 }
 
 // isCompatible checks that given private key is compatible with the signature scheme.
@@ -92,10 +113,6 @@ func (a *Algorithm) isCompatible(signer crypto.Signer) bool {
 // ParseSignatureSchemes translates []tls.SignatureScheme to []signatureHashAlgorithm.
 // It returns default signature scheme list if no SignatureScheme is passed.
 // This function handles both TLS 1.2 byte-split encoding and TLS 1.3 PSS full uint16 schemes.
-//
-// For DTLS 1.2 / TLS 1.2, this returns Algorithms() which excludes TLS 1.3-specific
-// schemes like RSA-PSS for compatibility with implementations like OpenSSL.
-// When DTLS 1.3 is implemented, use Algorithms13() or create ParseSignatureSchemes13().
 func ParseSignatureSchemes(sigs []tls.SignatureScheme, insecureHashes bool) ([]Algorithm, error) {
 	if len(sigs) == 0 {
 		return Algorithms(), nil
@@ -116,7 +133,7 @@ func ParseSignatureSchemes(sigs []tls.SignatureScheme, insecureHashes bool) ([]A
 	}
 
 	if len(out) == 0 {
-		return nil, dtlserrors.ErrSignatureHashNoAvailableSignatureSchemes
+		return nil, dtlserrors.ErrNoAvailableSignatureSchemes
 	}
 
 	return out, nil
@@ -128,13 +145,22 @@ func FromCertificate(cert *x509.Certificate) (Algorithm, error) { //nolint:cyclo
 	var sigAlg signature.Algorithm
 
 	switch cert.SignatureAlgorithm {
-	case x509.SHA256WithRSA, x509.SHA256WithRSAPSS:
+	case x509.SHA256WithRSAPSS:
+		hashAlg = hash.SHA256
+		sigAlg = signature.RSA_PSS_RSAE_SHA256
+	case x509.SHA384WithRSAPSS:
+		hashAlg = hash.SHA384
+		sigAlg = signature.RSA_PSS_RSAE_SHA384
+	case x509.SHA512WithRSAPSS:
+		hashAlg = hash.SHA512
+		sigAlg = signature.RSA_PSS_RSAE_SHA512
+	case x509.SHA256WithRSA:
 		hashAlg = hash.SHA256
 		sigAlg = signature.RSA
-	case x509.SHA384WithRSA, x509.SHA384WithRSAPSS:
+	case x509.SHA384WithRSA:
 		hashAlg = hash.SHA384
 		sigAlg = signature.RSA
-	case x509.SHA512WithRSA, x509.SHA512WithRSAPSS:
+	case x509.SHA512WithRSA:
 		hashAlg = hash.SHA512
 		sigAlg = signature.RSA
 	case x509.ECDSAWithSHA256:
@@ -156,7 +182,7 @@ func FromCertificate(cert *x509.Certificate) (Algorithm, error) { //nolint:cyclo
 		hashAlg = hash.SHA1
 		sigAlg = signature.ECDSA
 	default:
-		return Algorithm{}, dtlserrors.ErrSignatureHashInvalidSignatureAlgorithm
+		return Algorithm{}, dtlserrors.ErrInvalidSignatureAlgorithm
 	}
 
 	return Algorithm{Hash: hashAlg, Signature: sigAlg}, nil
@@ -171,7 +197,7 @@ func (a *Algorithm) Unmarshal(sigScheme tls.SignatureScheme) error {
 		a.Signature = signature.Algorithm(sigScheme)
 		a.Hash = hash.ExtractHashFromPSS(uint16(sigScheme))
 		if a.Hash == hash.None {
-			return dtlserrors.ErrSignatureHashInvalidHashAlgorithm
+			return dtlserrors.ErrInvalidHashAlgorithm
 		}
 	} else {
 		// TLS 1.2 style - split into hash (high byte) and signature (low byte)
@@ -181,12 +207,12 @@ func (a *Algorithm) Unmarshal(sigScheme tls.SignatureScheme) error {
 
 	// Validate signature algorithm
 	if _, ok := signature.Algorithms()[a.Signature]; !ok {
-		return dtlserrors.ErrSignatureHashInvalidSignatureAlgorithm
+		return dtlserrors.ErrInvalidSignatureAlgorithm
 	}
 
 	// Validate hash algorithm
 	if _, ok := hash.Algorithms()[a.Hash]; !ok || (ok && a.Hash == hash.None) {
-		return dtlserrors.ErrSignatureHashInvalidHashAlgorithm
+		return dtlserrors.ErrInvalidHashAlgorithm
 	}
 
 	return nil

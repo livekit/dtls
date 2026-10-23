@@ -7,17 +7,19 @@
 package udp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
-	dtlsnet "github.com/pion/dtls/v3/pkg/net"
-	"github.com/pion/transport/v4/test"
+	dtlsnet "github.com/pion/dtls/v4/pkg/net"
+	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -111,9 +113,7 @@ func TestListenerCloseUnaccepted(t *testing.T) {
 	const backlog = 2
 
 	network, addr := getConfig()
-	listener, err := (&ListenConfig{
-		Backlog: backlog,
-	}).Listen(network, addr)
+	listener, err := listenAddr(network, addr, WithBacklog(backlog))
 	assert.NoError(t, err)
 
 	for i := range backlog {
@@ -162,11 +162,9 @@ func TestListenerAcceptFilter(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			network, addr := getConfig()
-			listener, err := (&ListenConfig{
-				AcceptFilter: func(pkt []byte) bool {
-					return pkt[0] == 0xAA
-				},
-			}).Listen(network, addr)
+			listener, err := listenAddr(network, addr, WithAcceptFilter(func(pkt []byte) bool {
+				return pkt[0] == 0xAA
+			}))
 			assert.NoError(t, err)
 
 			var wgAcceptLoop sync.WaitGroup
@@ -213,7 +211,7 @@ func TestListenerAcceptFilter(t *testing.T) {
 	}
 }
 
-func TestListenerConcurrent(t *testing.T) { //nolint:gocyclo
+func TestListenerConcurrent(t *testing.T) {
 	// Limit runtime in case of deadlocks
 	lim := test.TimeOut(time.Second * 20)
 	defer lim.Stop()
@@ -225,9 +223,7 @@ func TestListenerConcurrent(t *testing.T) { //nolint:gocyclo
 	const backlog = 2
 
 	network, addr := getConfig()
-	listener, err := (&ListenConfig{
-		Backlog: backlog,
-	}).Listen(network, addr)
+	listener, err := listenAddr(network, addr, WithBacklog(backlog))
 	assert.NoError(t, err)
 
 	for i := range backlog + 1 {
@@ -280,7 +276,7 @@ func TestListenerConcurrent(t *testing.T) { //nolint:gocyclo
 func pipe() (dtlsnet.PacketListener, net.PacketConn, *net.UDPConn, error) {
 	// Start listening
 	network, addr := getConfig()
-	listener, err := Listen(network, addr)
+	listener, err := listenAddr(network, addr)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to listen: %w", err)
 	}
@@ -328,7 +324,16 @@ func getConfig() (string, *net.UDPAddr) {
 	return "udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}
 }
 
-func TestConnClose(t *testing.T) { //nolint:cyclop
+func listenAddr(network string, addr *net.UDPAddr, opts ...ListenerOption) (dtlsnet.PacketListener, error) {
+	conn, err := net.ListenUDP(network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	return Listen(conn, opts...), nil
+}
+
+func TestConnClose(t *testing.T) {
 	lim := test.TimeOut(time.Second * 5)
 	defer lim.Stop()
 
@@ -406,7 +411,7 @@ func TestConnClose(t *testing.T) { //nolint:cyclop
 	})
 }
 
-func TestListenerCustomConnIDs(t *testing.T) { //nolint:gocyclo,cyclop,maintidx
+func TestListenerCustomConnIDs(t *testing.T) { //nolint:cyclop
 	const helloPayload, setPayload = "hello", "set"
 	const serverCount, clientCount = 5, 20
 	// Limit runtime in case of deadlocks.
@@ -422,10 +427,10 @@ func TestListenerCustomConnIDs(t *testing.T) { //nolint:gocyclo,cyclop,maintidx
 		Payload string
 	}
 	network, addr := getConfig()
-	listener, err := (&ListenConfig{
+	listener, err := listenAddr(network, addr,
 		// For all datagrams other than the initial "hello" packet, use the ID
 		// to route.
-		DatagramRouter: func(buf []byte) (string, bool) {
+		WithDatagramRouter(func(buf []byte) (string, bool) {
 			var p pkt
 			if err := json.Unmarshal(buf, &p); err != nil {
 				return "", false
@@ -435,20 +440,8 @@ func TestListenerCustomConnIDs(t *testing.T) { //nolint:gocyclo,cyclop,maintidx
 			}
 
 			return fmt.Sprint(p.ID), true
-		},
-		// Use the outgoing "set" payload to add an identifier for a connection.
-		ConnectionIdentifier: func(buf []byte) (string, bool) {
-			var p pkt
-			if err := json.Unmarshal(buf, &p); err != nil {
-				return "", false
-			}
-			if p.Payload == setPayload {
-				return fmt.Sprint(p.ID), true
-			}
-
-			return "", false
-		},
-	}).Listen(network, addr)
+		}),
+	)
 	assert.NoError(t, err)
 
 	var clientWg sync.WaitGroup
@@ -481,10 +474,15 @@ func TestListenerCustomConnIDs(t *testing.T) { //nolint:gocyclo,cyclop,maintidx
 			assert.Equal(t, helloPayload, udpPkt.Payload)
 			connID := udpPkt.ID
 
-			// Send set message to associate ID with this connection.
+			// Register the connection ID before advertising it to the peer.
+			packetConn, ok := conn.(*PacketConn)
+			assert.True(t, ok)
+			assert.NoError(t, packetConn.RegisterCID(fmt.Append(nil, connID)))
+
+			// Send set message to advertise the registered ID.
 			buf, err = json.Marshal(&pkt{
 				ID:      connID,
-				Payload: "set",
+				Payload: setPayload,
 			})
 			assert.NoError(t, err)
 
@@ -543,10 +541,8 @@ func TestListenerCustomConnIDs(t *testing.T) { //nolint:gocyclo,cyclop,maintidx
 
 			assert.NoError(t, json.Unmarshal(buf[:n], &udpPacket))
 
-			// Second message should be a set and custom connection identifier
-			// function will update the connection ID from remote address to the
-			// supplied ID.
-			assert.Equal(t, "set", udpPacket.Payload)
+			// The set message advertises the registered connection ID.
+			assert.Equal(t, setPayload, udpPacket.Payload)
 
 			// Ensure the connection ID matches what the "hello" message
 			// indicated.
@@ -589,4 +585,185 @@ func TestListenerCustomConnIDs(t *testing.T) { //nolint:gocyclo,cyclop,maintidx
 	// Wait for servers to exit.
 	serverWg.Wait()
 	assert.NoError(t, listener.Close())
+}
+
+type shortBufferPacketConn struct {
+	net.PacketConn
+	err         error
+	keepPrefix  bool
+	missingAddr bool
+}
+
+func (c *shortBufferPacketConn) ReadFrom(buf []byte) (int, net.Addr, error) {
+	if c.err == nil {
+		return c.PacketConn.ReadFrom(buf)
+	}
+
+	packet := make([]byte, 1024)
+	n, addr, err := c.PacketConn.ReadFrom(packet)
+	if err != nil {
+		return n, addr, err
+	}
+	err, c.err = c.err, nil
+	if !c.keepPrefix {
+		return 0, nil, err
+	}
+	if c.missingAddr {
+		addr = nil
+	}
+
+	return copy(buf, packet[:n]), addr, err
+}
+
+func TestListenerIngressPreservesTruncatedPrefix(t *testing.T) {
+	const receiveLimit = 4
+
+	for _, testCase := range []struct {
+		name        string
+		err         error
+		keepPrefix  bool
+		missingAddr bool
+		terminal    bool
+	}{
+		// windows reports truncation without the sender address needed to route the prefix.
+		{name: "UDP truncation", keepPrefix: runtime.GOOS != "windows"},
+		{name: "short buffer without prefix", err: io.ErrShortBuffer},
+		{name: "wrapped short buffer without prefix", err: fmt.Errorf("read: %w", io.ErrShortBuffer)},
+		{name: "short buffer with prefix", err: io.ErrShortBuffer, keepPrefix: true},
+		{name: "wrapped short buffer with prefix", err: fmt.Errorf("read: %w", io.ErrShortBuffer), keepPrefix: true},
+		{name: "short buffer with prefix but no address", err: io.ErrShortBuffer, keepPrefix: true, missingAddr: true},
+		{name: "other read error", err: io.ErrUnexpectedEOF, keepPrefix: true, terminal: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			listenConfig := net.ListenConfig{}
+			receiver, err := listenConfig.ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
+			assert.NoError(t, err)
+			sender, err := listenConfig.ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
+			if !assert.NoError(t, err) {
+				assert.NoError(t, receiver.Close())
+
+				return
+			}
+			t.Cleanup(func() { assert.NoError(t, sender.Close()) })
+			filtered := make(chan []byte, 1)
+			listener := Listen(
+				&shortBufferPacketConn{
+					PacketConn: receiver, err: testCase.err,
+					keepPrefix: testCase.keepPrefix, missingAddr: testCase.missingAddr,
+				},
+				WithReceiveBufferSize(receiveLimit),
+				WithAcceptFilter(func(packet []byte) bool {
+					filtered <- bytes.Clone(packet)
+
+					return true
+				}),
+			)
+			t.Cleanup(func() { assert.NoError(t, listener.Close()) })
+
+			oversized := []byte("abcdef")
+			exact := []byte("next")
+			for _, packet := range [][]byte{oversized, exact} {
+				n, writeErr := sender.WriteTo(packet, receiver.LocalAddr())
+				assert.NoError(t, writeErr)
+				assert.Equal(t, len(packet), n)
+			}
+
+			type acceptResult struct {
+				conn net.PacketConn
+				err  error
+			}
+			accepted := make(chan acceptResult, 1)
+			go func() {
+				conn, _, acceptErr := listener.Accept()
+				accepted <- acceptResult{conn: conn, err: acceptErr}
+			}()
+
+			var result acceptResult
+			select {
+			case result = <-accepted:
+			case <-time.After(time.Second):
+				assert.FailNow(t, "listener did not continue after a truncated datagram")
+			}
+			if testCase.terminal {
+				assert.ErrorIs(t, result.err, testCase.err)
+
+				return
+			}
+			assert.NoError(t, result.err)
+			assert.NotNil(t, result.conn)
+			t.Cleanup(func() {
+				assert.NoError(t, result.conn.Close())
+			})
+
+			buf := make([]byte, receiveLimit)
+			assert.NoError(t, result.conn.SetReadDeadline(time.Now().Add(time.Second)))
+			wantPrefix := testCase.keepPrefix && !testCase.missingAddr
+			if wantPrefix {
+				n, _, readErr := result.conn.ReadFrom(buf)
+				assert.NoError(t, readErr)
+				assert.Equal(t, oversized[:receiveLimit], buf[:n])
+				assert.Equal(t, oversized[:receiveLimit], <-filtered)
+			}
+			n, _, err := result.conn.ReadFrom(buf)
+			assert.NoError(t, err)
+			assert.Equal(t, exact, buf[:n])
+			if !wantPrefix {
+				assert.Equal(t, exact, <-filtered)
+			}
+		})
+	}
+}
+
+func newCIDAliasTestConn(t *testing.T, l *listener, port int) *PacketConn {
+	t.Helper()
+	conn := l.newPacketConn(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+	l.connWG.Add(1)
+	l.nConns.Add(1)
+	l.addresses[conn.address] = conn
+	t.Cleanup(func() { assert.NoError(t, conn.Close()) })
+
+	return conn
+}
+
+func TestPacketConnCIDAliases(t *testing.T) {
+	l := &listener{
+		cids:      make(map[string]*PacketConn),
+		addresses: make(map[addressKey]*PacketConn),
+		datagramRouter: func(buf []byte) (string, bool) {
+			return string(buf), true
+		},
+	}
+	conn := newCIDAliasTestConn(t, l, 1)
+	other := newCIDAliasTestConn(t, l, 2)
+	routesTo := func(cid string, want *PacketConn) {
+		t.Helper()
+		got, ok, err := l.getConn(&net.UDPAddr{Port: 3}, []byte(cid))
+		assert.NoError(t, err)
+		assert.Equal(t, want != nil, ok)
+		assert.Same(t, want, got)
+	}
+
+	assert.NoError(t, conn.RegisterCID([]byte("initial")))
+	alias := []byte("alias")
+	assert.NoError(t, conn.RegisterCIDs([][]byte{alias, alias, nil}))
+	alias[0] = 'X'
+	routesTo("initial", conn)
+	routesTo("alias", conn)
+	routesTo("unknown", nil)
+	routesTo("", nil)
+
+	assert.NoError(t, other.RegisterCID([]byte("taken")))
+	assert.ErrorIs(t, conn.RegisterCIDs([][]byte{[]byte("unused"), []byte("taken")}), ErrCIDInUse)
+	routesTo("unused", nil)
+	routesTo("alias", conn)
+	routesTo("taken", other)
+	assert.ErrorIs(t, conn.RegisterCID([]byte("taken")), ErrCIDInUse)
+	routesTo("initial", conn)
+
+	conn.UnregisterCID([]byte("taken"))
+	conn.UnregisterCID([]byte("alias"))
+	conn.UnregisterCID([]byte("alias"))
+	routesTo("taken", other)
+	routesTo("alias", nil)
+	routesTo("initial", conn)
 }

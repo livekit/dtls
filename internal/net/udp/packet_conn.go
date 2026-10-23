@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 // Package udp implements DTLS specific UDP networking primitives.
-// NOTE: this package is an adaption of pion/transport/udp that allows for
+// NOTE: this package is an adaptation of pion/transport/udp that allows for
 // routing datagrams based on identifiers other than the remote address. The
 // primary use case for this functionality is routing based on DTLS connection
 // IDs. In order to allow for consumers of this package to treat connections as
-// generic net.PackageConn, routing and identitier establishment is based on
-// custom introspecion of datagrams, rather than direct intervention by
+// generic net.PacketConn, routing and identifier establishment is based on
+// custom introspection of datagrams, rather than direct intervention by
 // consumers. If possible, the updates made in this repository will be reflected
 // back upstream. If not, it is likely that this will be moved to a public
 // package in this repository.
@@ -18,43 +18,61 @@ package udp
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	idtlsnet "github.com/pion/dtls/v3/internal/net"
-	dtlsnet "github.com/pion/dtls/v3/pkg/net"
-	"github.com/pion/transport/v4/deadline"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	idtlsnet "github.com/pion/dtls/v4/internal/net"
+	dtlsnet "github.com/pion/dtls/v4/pkg/net"
+	"github.com/pion/transport/v5/deadline"
 )
 
 const (
-	receiveMTU           = 8192
-	defaultListenBacklog = 128 // same as Linux default
+	defaultReceiveBufferSize = 8192
+	defaultListenBacklog     = 128 // same as Linux default
 )
 
 // Typed errors.
 var (
 	ErrClosedListener      = dtlserrors.ErrUDPClosedListener
 	ErrListenQueueExceeded = dtlserrors.ErrUDPListenQueueExceeded
+	ErrCIDInUse            = errors.New("connection ID already belongs to another connection")
+	ErrAddressInUse        = errors.New("remote address already belongs to another connection")
 )
+
+type addressKey struct {
+	network string
+	address string
+}
+
+func keyForAddress(addr net.Addr) addressKey {
+	return addressKey{network: addr.Network(), address: addr.String()}
+}
 
 // listener augments a connection-oriented Listener over a UDP PacketConn.
 type listener struct {
-	pConn *net.UDPConn
+	pConn net.PacketConn
 
-	accepting      atomic.Value // bool
-	acceptCh       chan *PacketConn
-	doneCh         chan struct{}
-	doneOnce       sync.Once
-	acceptFilter   func([]byte) bool
-	datagramRouter func([]byte) (string, bool)
-	connIdentifier func([]byte) (string, bool)
+	accepting         atomic.Bool
+	acceptMu          sync.Mutex // serializes new-connection admission with shutdown's queue drain
+	acceptCh          chan *PacketConn
+	doneCh            chan struct{}
+	doneOnce          sync.Once
+	acceptFilter      func([]byte) bool
+	datagramRouter    func([]byte) (string, bool)
+	receiveBufferSize int
+	backlog           int
 
-	connLock sync.Mutex
-	conns    map[string]*PacketConn
-	connWG   sync.WaitGroup
+	routesMu  sync.RWMutex
+	cids      map[string]*PacketConn
+	addresses map[addressKey]*PacketConn
+
+	nConns atomic.Int64
+	connWG sync.WaitGroup
 
 	readWG   sync.WaitGroup
 	errClose atomic.Value // error
@@ -67,9 +85,8 @@ type listener struct {
 func (l *listener) Accept() (net.PacketConn, net.Addr, error) {
 	select {
 	case c := <-l.acceptCh:
-		l.connWG.Add(1)
 
-		return c, c.raddr, nil
+		return c, c.raddr.Load().(net.Addr), nil //nolint:forcetypeassert
 
 	case <-l.readDoneCh:
 		err, _ := l.errRead.Load().(error)
@@ -89,30 +106,30 @@ func (l *listener) Close() error {
 		l.accepting.Store(false)
 		close(l.doneCh)
 
-		l.connLock.Lock()
+		// Wait for in-flight admissions before draining the queue.
+		l.acceptMu.Lock()
+
 		// Close unaccepted connections
-	lclose:
 		for {
 			select {
 			case c := <-l.acceptCh:
-				close(c.doneCh)
-				// If we have an alternate identifier, remove it from the connection
-				// map.
-				if id := c.id.Load(); id != nil {
-					delete(l.conns, id.(string)) //nolint:forcetypeassert
+				if !c.closing.Swap(true) {
+					c.listener.nConns.Add(-1)
+					l.connWG.Done()
+					close(c.doneCh)
+					l.removeRoutes(c)
+					_ = c.buffer.Close()
 				}
-				// If we haven't already removed the remote address, remove it
-				// from the connection map.
-				if c.rmraddr.Load() == nil {
-					delete(l.conns, c.raddr.String())
-					c.rmraddr.Store(true)
-				}
+
+				continue
 			default:
-				break lclose
 			}
+
+			break
 		}
-		nConns := len(l.conns)
-		l.connLock.Unlock()
+
+		nConns := l.nConns.Load()
+		l.acceptMu.Unlock()
 
 		l.connWG.Done()
 
@@ -135,66 +152,59 @@ func (l *listener) Addr() net.Addr {
 	return l.pConn.LocalAddr()
 }
 
-// ListenConfig stores options for listening to an address.
-type ListenConfig struct {
-	// Backlog defines the maximum length of the queue of pending
-	// connections. It is equivalent of the backlog argument of
-	// POSIX listen function.
-	// If a connection request arrives when the queue is full,
-	// the request will be silently discarded, unlike TCP.
-	// Set zero to use default value 128 which is same as Linux default.
-	Backlog int
+// ListenerOption configures a packet listener.
+type ListenerOption func(*listener)
 
-	// AcceptFilter determines whether the new conn should be made for
-	// the incoming packet. If not set, any packet creates new conn.
-	AcceptFilter func([]byte) bool
-
-	// DatagramRouter routes an incoming datagram to a connection by extracting
-	// an identifier from the its paylod
-	DatagramRouter func([]byte) (string, bool)
-
-	// ConnectionIdentifier extracts an identifier from an outgoing packet. If
-	// the identifier is not already associated with the connection, it will be
-	// added.
-	ConnectionIdentifier func([]byte) (string, bool)
-
-	// Internal listen config used to open the UDP socket.
-	ListenConfig net.ListenConfig
+// WithBacklog sets the maximum number of pending connections.
+func WithBacklog(backlog int) ListenerOption {
+	return func(l *listener) {
+		if backlog != 0 {
+			l.backlog = backlog
+		}
+	}
 }
 
-// Listen creates a new listener based on the ListenConfig.
-//
-//nolint:contextcheck
-func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (dtlsnet.PacketListener, error) {
-	if lc.Backlog == 0 {
-		lc.Backlog = defaultListenBacklog
+// WithAcceptFilter sets the filter used to admit new connections.
+func WithAcceptFilter(filter func([]byte) bool) ListenerOption {
+	return func(l *listener) {
+		l.acceptFilter = filter
 	}
+}
 
-	laddrStr := ":0"
-	if laddr != nil {
-		laddrStr = laddr.String()
+// WithDatagramRouter sets the function used to route incoming datagrams.
+func WithDatagramRouter(router func([]byte) (string, bool)) ListenerOption {
+	return func(l *listener) {
+		l.datagramRouter = router
 	}
-	innerConn, err := lc.ListenConfig.ListenPacket(context.Background(), network, laddrStr)
-	if err != nil {
-		return nil, err
-	}
-	conn, ok := innerConn.(*net.UDPConn)
-	if !ok {
-		return nil, dtlserrors.ErrUDPListenPacketNotUDPConn
-	}
+}
 
+// WithReceiveBufferSize sets the size of the buffer used to read incoming datagrams.
+func WithReceiveBufferSize(size int) ListenerOption {
+	return func(l *listener) {
+		if size > 0 {
+			l.receiveBufferSize = size
+		}
+	}
+}
+
+// Listen creates a new listener over conn.
+func Listen(conn net.PacketConn, opts ...ListenerOption) dtlsnet.PacketListener {
 	packetListener := &listener{
-		pConn:          conn,
-		acceptCh:       make(chan *PacketConn, lc.Backlog),
-		conns:          make(map[string]*PacketConn),
-		doneCh:         make(chan struct{}),
-		acceptFilter:   lc.AcceptFilter,
-		datagramRouter: lc.DatagramRouter,
-		connIdentifier: lc.ConnectionIdentifier,
-		readDoneCh:     make(chan struct{}),
+		pConn:             conn,
+		backlog:           defaultListenBacklog,
+		receiveBufferSize: defaultReceiveBufferSize,
+		doneCh:            make(chan struct{}),
+		readDoneCh:        make(chan struct{}),
+		cids:              make(map[string]*PacketConn),
+		addresses:         make(map[addressKey]*PacketConn),
+	}
+	for _, opt := range opts {
+		opt(packetListener)
 	}
 
+	packetListener.acceptCh = make(chan *PacketConn, packetListener.backlog)
 	packetListener.accepting.Store(true)
+
 	packetListener.connWG.Add(1)
 	packetListener.readWG.Add(2) // wait readLoop and Close execution routine
 
@@ -207,12 +217,7 @@ func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (dtlsnet.Pack
 		packetListener.readWG.Done()
 	}()
 
-	return packetListener, nil
-}
-
-// Listen creates a new listener using default ListenConfig.
-func Listen(network string, laddr *net.UDPAddr) (dtlsnet.PacketListener, error) {
-	return (&ListenConfig{}).Listen(network, laddr)
+	return packetListener
 }
 
 // readLoop dispatches packets to the proper connection, creating a new one if
@@ -221,11 +226,15 @@ func (l *listener) readLoop() {
 	defer l.readWG.Done()
 	defer close(l.readDoneCh)
 
-	buf := make([]byte, receiveMTU)
+	buf := make([]byte, l.receiveBufferSize)
 
 	for {
 		n, raddr, err := l.pConn.ReadFrom(buf)
-		if err != nil {
+		if idtlsnet.IsShortBuffer(err) {
+			if n == 0 || raddr == nil {
+				continue
+			}
+		} else if err != nil {
 			l.errRead.Store(err)
 
 			return
@@ -242,68 +251,183 @@ func (l *listener) readLoop() {
 
 // getConn gets an existing connection or creates a new one.
 func (l *listener) getConn(raddr net.Addr, buf []byte) (*PacketConn, bool, error) { //nolint:cyclop
-	l.connLock.Lock()
-	defer l.connLock.Unlock()
-	// If we have a custom resolver, use it.
 	if l.datagramRouter != nil {
-		if id, ok := l.datagramRouter(buf); ok {
-			if conn, ok := l.conns[id]; ok {
-				return conn, true, nil
+		if cid, ok := l.datagramRouter(buf); ok {
+			l.routesMu.RLock()
+			conn := l.cids[cid]
+			l.routesMu.RUnlock()
+			if conn == nil || conn.closing.Load() {
+				return nil, false, nil
 			}
+
+			return conn, true, nil
 		}
 	}
 
-	// If we don't have a custom resolver, or we were unable to find an
-	// associated connection, fall back to remote address.
-	conn, ok := l.conns[raddr.String()]
-	if !ok {
-		if isAccepting, ok := l.accepting.Load().(bool); !isAccepting || !ok {
-			return nil, false, ErrClosedListener
-		}
-		if l.acceptFilter != nil {
-			if !l.acceptFilter(buf) {
-				return nil, false, nil
-			}
-		}
-		conn = l.newPacketConn(raddr)
-		select {
-		case l.acceptCh <- conn:
-			l.conns[raddr.String()] = conn
-		default:
-			return nil, false, ErrListenQueueExceeded
-		}
+	key := keyForAddress(raddr)
+	l.routesMu.RLock()
+	conn := l.addresses[key]
+	l.routesMu.RUnlock()
+	if conn != nil {
+		return conn, !conn.closing.Load(), nil
+	}
+	if !l.accepting.Load() {
+		return nil, false, ErrClosedListener
+	}
+	if l.acceptFilter != nil && !l.acceptFilter(buf) {
+		return nil, false, nil
+	}
+
+	l.acceptMu.Lock()
+	defer l.acceptMu.Unlock()
+	if !l.accepting.Load() {
+		return nil, false, ErrClosedListener
+	}
+	l.routesMu.Lock()
+	defer l.routesMu.Unlock()
+	if conn = l.addresses[key]; conn != nil {
+		return conn, !conn.closing.Load(), nil
+	}
+	conn = l.newPacketConn(raddr)
+	l.nConns.Add(1)
+	l.connWG.Add(1)
+	select {
+	case l.acceptCh <- conn:
+		l.addresses[key] = conn
+	default:
+		l.nConns.Add(-1)
+		l.connWG.Done()
+		_ = conn.buffer.Close()
+
+		return nil, false, ErrListenQueueExceeded
 	}
 
 	return conn, true, nil
 }
 
-// PacketConn is a net.PacketConn implementation that is able to dictate its
-// routing ID via an alternate identifier from its remote address. Internal
-// buffering is performed for reads, and writes are passed through to the
-// underlying net.PacketConn.
+// PacketConn is a net.PacketConn implementation with explicit CID and address routing.
 type PacketConn struct {
 	listener *listener
 
-	raddr   net.Addr
-	rmraddr atomic.Value // bool
-	id      atomic.Value // string
+	closing atomic.Bool
+	raddr   atomic.Value // net.Addr
+
+	cids    map[string]struct{}
+	address addressKey
 
 	buffer *idtlsnet.PacketBuffer
 
-	doneCh   chan struct{}
-	doneOnce sync.Once
+	doneCh chan struct{}
 
 	writeDeadline *deadline.Deadline
 }
 
 // newPacketConn constructs a new PacketConn.
 func (l *listener) newPacketConn(raddr net.Addr) *PacketConn {
-	return &PacketConn{
+	res := &PacketConn{
 		listener:      l,
-		raddr:         raddr,
+		cids:          make(map[string]struct{}),
+		address:       keyForAddress(raddr),
 		buffer:        idtlsnet.NewPacketBuffer(),
 		doneCh:        make(chan struct{}),
 		writeDeadline: deadline.New(),
+	}
+	res.raddr.Store(raddr)
+
+	return res
+}
+
+// RegisterCID replaces all inbound CID aliases with cid.
+func (c *PacketConn) RegisterCID(cid []byte) error {
+	c.listener.routesMu.Lock()
+	defer c.listener.routesMu.Unlock()
+	if c.closing.Load() {
+		return io.EOF
+	}
+	key := string(cid)
+	if owner := c.listener.cids[key]; owner != nil && owner != c {
+		return ErrCIDInUse
+	}
+	c.removeCIDsLocked()
+	if key != "" {
+		c.listener.cids[key] = c
+		c.cids[key] = struct{}{}
+	}
+
+	return nil
+}
+
+// RegisterCIDs atomically reserves additional inbound CID aliases.
+func (c *PacketConn) RegisterCIDs(cids [][]byte) error {
+	c.listener.routesMu.Lock()
+	defer c.listener.routesMu.Unlock()
+	if c.closing.Load() {
+		return io.EOF
+	}
+	for _, cid := range cids {
+		if owner := c.listener.cids[string(cid)]; owner != nil && owner != c {
+			return ErrCIDInUse
+		}
+	}
+	for _, cid := range cids {
+		if len(cid) != 0 {
+			key := string(cid)
+			c.listener.cids[key] = c
+			c.cids[key] = struct{}{}
+		}
+	}
+
+	return nil
+}
+
+// UnregisterCID removes an inbound alias owned by this connection.
+func (c *PacketConn) UnregisterCID(cid []byte) {
+	c.listener.routesMu.Lock()
+	defer c.listener.routesMu.Unlock()
+	key := string(cid)
+	if c.listener.cids[key] == c {
+		delete(c.listener.cids, key)
+	}
+	delete(c.cids, key)
+}
+
+// removeCIDsLocked requires listener.routesMu to be held.
+func (c *PacketConn) removeCIDsLocked() {
+	for key := range c.cids {
+		if c.listener.cids[key] == c {
+			delete(c.listener.cids, key)
+		}
+	}
+	clear(c.cids)
+}
+
+// SetRemoteAddr updates address routing after the migration policy accepts a path.
+func (c *PacketConn) SetRemoteAddr(addr net.Addr) error {
+	c.listener.routesMu.Lock()
+	defer c.listener.routesMu.Unlock()
+	if c.closing.Load() {
+		return io.EOF
+	}
+	key := keyForAddress(addr)
+	if owner := c.listener.addresses[key]; owner != nil && owner != c {
+		return ErrAddressInUse
+	}
+	if c.listener.addresses[c.address] == c {
+		delete(c.listener.addresses, c.address)
+	}
+	c.listener.addresses[key] = c
+	c.address = key
+	c.raddr.Store(addr)
+
+	return nil
+}
+
+func (l *listener) removeRoutes(c *PacketConn) {
+	l.routesMu.Lock()
+	defer l.routesMu.Unlock()
+	c.removeCIDsLocked()
+	if l.addresses[c.address] == c {
+		delete(l.addresses, c.address)
 	}
 }
 
@@ -315,41 +439,8 @@ func (c *PacketConn) ReadFrom(buff []byte) (int, net.Addr, error) {
 
 // WriteTo writes len(payload) bytes from payload to the specified address.
 func (c *PacketConn) WriteTo(payload []byte, addr net.Addr) (n int, err error) {
-	// If we have a connection identifier, check to see if the outgoing packet
-	// sets it.
-	if c.listener.connIdentifier != nil {
-		id := c.id.Load()
-		// Only update establish identifier if we haven't already done so.
-		if id == nil {
-			candidate, ok := c.listener.connIdentifier(payload)
-			// If we have an identifier, add entry to connection map.
-			if ok {
-				c.listener.connLock.Lock()
-				c.listener.conns[candidate] = c
-				c.listener.connLock.Unlock()
-				c.id.Store(candidate)
-			}
-		}
-		// If we are writing to a remote address that differs from the initial,
-		// we have an alternate identifier established, and we haven't already
-		// freed the remote address, free the remote address to be used by
-		// another connection.
-		// Note: this strategy results in holding onto a remote address after it
-		// is potentially no longer in use by the client. However, releasing
-		// earlier means that we could miss some packets that should have been
-		// routed to this connection. Ideally, we would drop the connection
-		// entry for the remote address as soon as the client starts sending
-		// using an alternate identifier, but in practice this proves
-		// challenging because any client could spoof a connection identifier,
-		// resulting in the remote address entry being dropped prior to the
-		// "real" client transitioning to sending using the alternate
-		// identifier.
-		if id != nil && c.rmraddr.Load() == nil && addr.String() != c.raddr.String() {
-			c.listener.connLock.Lock()
-			delete(c.listener.conns, c.raddr.String())
-			c.rmraddr.Store(true)
-			c.listener.connLock.Unlock()
-		}
+	if c.closing.Load() {
+		return 0, io.EOF
 	}
 
 	select {
@@ -364,25 +455,14 @@ func (c *PacketConn) WriteTo(payload []byte, addr net.Addr) (n int, err error) {
 // Close closes the conn and releases any Read calls.
 func (c *PacketConn) Close() error {
 	var err error
-	c.doneOnce.Do(func() {
+	if !c.closing.Swap(true) { //nolint:nestif
 		c.listener.connWG.Done()
 		close(c.doneCh)
-		c.listener.connLock.Lock()
-		// If we have an alternate identifier, remove it from the connection
-		// map.
-		if id := c.id.Load(); id != nil {
-			delete(c.listener.conns, id.(string)) //nolint:forcetypeassert
-		}
-		// If we haven't already removed the remote address, remove it from the
-		// connection map.
-		if c.rmraddr.Load() == nil {
-			delete(c.listener.conns, c.raddr.String())
-			c.rmraddr.Store(true)
-		}
-		nConns := len(c.listener.conns)
-		c.listener.connLock.Unlock()
+		c.listener.removeRoutes(c)
 
-		if isAccepting, ok := c.listener.accepting.Load().(bool); nConns == 0 && !isAccepting && ok {
+		nConns := c.listener.nConns.Add(-1)
+
+		if nConns == 0 && !c.listener.accepting.Load() {
 			// Wait if this is the final connection
 			c.listener.readWG.Wait()
 			if errClose, ok := c.listener.errClose.Load().(error); ok {
@@ -395,7 +475,7 @@ func (c *PacketConn) Close() error {
 		if errBuf := c.buffer.Close(); errBuf != nil && err == nil {
 			err = errBuf
 		}
-	})
+	}
 
 	return err
 }

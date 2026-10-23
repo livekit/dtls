@@ -7,13 +7,14 @@ package prf
 import (
 	"crypto/ecdh"
 	"crypto/hmac"
+	"crypto/mlkem"
 	"encoding/binary"
 	"fmt"
 	"hash"
 	"math"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/pkg/crypto/elliptic"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/pkg/crypto/elliptic"
 )
 
 const (
@@ -102,8 +103,17 @@ func EcdhePSKPreMasterSecret(psk, publicKey, privateKey []byte, curve elliptic.C
 	return out, nil
 }
 
-// PreMasterSecret implements TLS 1.2 Premaster Secret generation given a keypair and a curve.
+// PreMasterSecret implements ECDHE and hybrid key agreement for a peer public
+// key, local private key, and negotiated group.
 func PreMasterSecret(publicKey, privateKey []byte, curve elliptic.Curve) ([]byte, error) {
+	if curve == elliptic.X25519MLKEM768 {
+		return x25519MLKEM768PreMasterSecret(publicKey, privateKey)
+	}
+
+	return ecdhPreMasterSecret(publicKey, privateKey, curve)
+}
+
+func ecdhPreMasterSecret(publicKey, privateKey []byte, curve elliptic.Curve) ([]byte, error) {
 	var ec ecdh.Curve
 
 	switch curve {
@@ -114,7 +124,7 @@ func PreMasterSecret(publicKey, privateKey []byte, curve elliptic.Curve) ([]byte
 	case elliptic.P384:
 		ec = ecdh.P384()
 	default:
-		return nil, dtlserrors.ErrInvalidNamedCurveFatal
+		return nil, dtlserrors.ErrInvalidNamedCurve
 	}
 
 	sk, err := ec.NewPrivateKey(privateKey)
@@ -128,6 +138,61 @@ func PreMasterSecret(publicKey, privateKey []byte, curve elliptic.Curve) ([]byte
 	}
 
 	return sk.ECDH(pk)
+}
+
+func x25519MLKEM768PreMasterSecret(publicKey, privateKey []byte) ([]byte, error) {
+	switch len(privateKey) {
+	case elliptic.X25519MLKEM768ClientPrivateKeySize:
+		return x25519MLKEM768ClientPreMasterSecret(publicKey, privateKey)
+	case elliptic.X25519MLKEM768ServerPrivateKeySize:
+		return x25519MLKEM768ServerPreMasterSecret(publicKey, privateKey)
+	default:
+		return nil, dtlserrors.ErrLengthMismatch
+	}
+}
+
+func x25519MLKEM768ClientPreMasterSecret(serverPublicKey, clientPrivateKey []byte) ([]byte, error) {
+	if len(serverPublicKey) != elliptic.X25519MLKEM768ServerPublicKeySize {
+		return nil, dtlserrors.ErrLengthMismatch
+	}
+
+	mlkemSecretKey, err := mlkem.NewDecapsulationKey768(clientPrivateKey[:mlkem.SeedSize])
+	if err != nil {
+		return nil, err
+	}
+
+	mlkemSharedKey, err := mlkemSecretKey.Decapsulate(serverPublicKey[:mlkem.CiphertextSize768])
+	if err != nil {
+		return nil, err
+	}
+
+	x25519SharedKey, err := ecdhPreMasterSecret(serverPublicKey[mlkem.CiphertextSize768:], clientPrivateKey[mlkem.SeedSize:], elliptic.X25519)
+	if err != nil {
+		return nil, err
+	}
+
+	secret := make([]byte, 0, elliptic.X25519MLKEM768SharedSecretSize)
+	secret = append(secret, mlkemSharedKey...)
+	secret = append(secret, x25519SharedKey...)
+
+	return secret, nil
+}
+
+func x25519MLKEM768ServerPreMasterSecret(clientPublicKey, serverPrivateKey []byte) ([]byte, error) {
+	if len(clientPublicKey) != elliptic.X25519MLKEM768ClientPublicKeySize {
+		return nil, dtlserrors.ErrLengthMismatch
+	}
+
+	x25519SharedKey, err := ecdhPreMasterSecret(clientPublicKey[mlkem.EncapsulationKeySize768:], serverPrivateKey[mlkem.SharedKeySize:], elliptic.X25519)
+	if err != nil {
+		return nil, err
+	}
+
+	secret := make([]byte, 0, elliptic.X25519MLKEM768SharedSecretSize)
+	secret = append(secret, serverPrivateKey[:mlkem.SharedKeySize]...)
+	secret = append(secret, x25519SharedKey...)
+
+	return secret, nil
 }
 
 // PHash is PRF is the SHA-256 hash function is used for all cipher suites
@@ -200,11 +265,7 @@ func MasterSecret(preMasterSecret, clientRandom, serverRandom []byte, h HashFunc
 
 // GenerateEncryptionKeys is the final step TLS 1.2 PRF. Given all state generated so far generates
 // the final keys need for encryption.
-func GenerateEncryptionKeys(
-	masterSecret, clientRandom, serverRandom []byte,
-	macLen, keyLen, ivLen int,
-	h HashFunc,
-) (*EncryptionKeys, error) {
+func GenerateEncryptionKeys(masterSecret, clientRandom, serverRandom []byte, macLen, keyLen, ivLen int, h HashFunc) (*EncryptionKeys, error) {
 	seed := append(append([]byte(keyExpansionLabel), serverRandom...), clientRandom...)
 	keyMaterial, err := PHash(masterSecret, seed, (2*macLen)+(2*keyLen)+(2*ivLen), h)
 	if err != nil {
@@ -228,15 +289,7 @@ func GenerateEncryptionKeys(
 
 	serverWriteIV := keyMaterial[:ivLen]
 
-	return &EncryptionKeys{
-		MasterSecret:   masterSecret,
-		ClientMACKey:   clientMACKey,
-		ServerMACKey:   serverMACKey,
-		ClientWriteKey: clientWriteKey,
-		ServerWriteKey: serverWriteKey,
-		ClientWriteIV:  clientWriteIV,
-		ServerWriteIV:  serverWriteIV,
-	}, nil
+	return &EncryptionKeys{MasterSecret: masterSecret, ClientMACKey: clientMACKey, ServerMACKey: serverMACKey, ClientWriteKey: clientWriteKey, ServerWriteKey: serverWriteKey, ClientWriteIV: clientWriteIV, ServerWriteIV: serverWriteIV}, nil
 }
 
 func prfVerifyData(masterSecret, handshakeBodies []byte, label string, hashFunc HashFunc) ([]byte, error) {

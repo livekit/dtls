@@ -4,8 +4,9 @@
 package extension
 
 import (
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"golang.org/x/crypto/cryptobyte"
+	"bytes"
+
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 )
 
 // ConnectionID is a DTLS extension that provides an alternative to IP address
@@ -19,51 +20,42 @@ type ConnectionID struct {
 	CID []byte // variable length
 }
 
-// TypeValue returns the extension TypeValue.
-func (c ConnectionID) TypeValue() TypeValue {
-	return ConnectionIDTypeValue
+// ExtensionType returns the IANA extension type for the payload-oriented API.
+func (c ConnectionID) ExtensionType() Type {
+	return TypeConnectionID
 }
 
-// Marshal encodes the extension.
-func (c *ConnectionID) Marshal() ([]byte, error) {
-	var b cryptobyte.Builder
-	b.AddUint16(uint16(c.TypeValue()))
-	b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
-		b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
-			b.AddBytes(c.CID)
-		})
-	})
+// MarshalSize returns the encoded payload size without serializing it.
+func (c ConnectionID) MarshalSize() int { return 1 + len(c.CID) }
 
-	return b.Bytes()
+// MarshalData encodes extension_data without the extension header.
+func (c ConnectionID) MarshalData() ([]byte, error) {
+	if len(c.CID) > 255 {
+		return nil, dtlserrors.ErrInvalidCIDFormat
+	}
+
+	out := make([]byte, 1, 1+len(c.CID))
+	out[0] = byte(len(c.CID)) //nolint:gosec // length is bounded above.
+	out = append(out, c.CID...)
+
+	return out, nil
 }
 
-// Unmarshal populates the extension from encoded data.
-func (c *ConnectionID) Unmarshal(data []byte) error {
-	val := cryptobyte.String(data)
-	var extension uint16
-	val.ReadUint16(&extension)
-	if TypeValue(extension) != c.TypeValue() {
-		return dtlserrors.ErrInvalidExtensionType
-	}
-
-	var extData cryptobyte.String
-	if !val.ReadUint16LengthPrefixed(&extData) {
-		return dtlserrors.ErrBufferTooSmall
-	}
-
-	var cid cryptobyte.String
-	if !extData.ReadUint8LengthPrefixed(&cid) {
+// UnmarshalData decodes extension_data without the extension header.
+func (c *ConnectionID) UnmarshalData(data []byte) error {
+	if len(data) == 0 {
 		return dtlserrors.ErrInvalidCIDFormat
 	}
 
-	if !extData.Empty() {
+	cidLen := int(data[0])
+	if cidLen > len(data)-1 {
+		return dtlserrors.ErrInvalidCIDFormat
+	}
+	if cidLen != len(data)-1 {
 		return dtlserrors.ErrLengthMismatch
 	}
 
-	c.CID = make([]byte, len(cid))
-	if !cid.CopyBytes(c.CID) {
-		return dtlserrors.ErrInvalidCIDFormat
-	}
+	c.CID = bytes.Clone(data[1:])
 
 	return nil
 }

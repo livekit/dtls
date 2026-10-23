@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -35,6 +36,16 @@ func equalBytes(t *testing.T, expected, actual []byte) {
 	t.Helper()
 
 	assert.Equal(t, expected, actual)
+}
+
+func waitForBlockedReaders(t *testing.T, buffer *PacketBuffer, count int) {
+	t.Helper()
+
+	if !assert.Eventually(t, func() bool {
+		return buffer.notify.Load().waiters.Load() == int64(count)
+	}, time.Second, time.Millisecond) {
+		assert.Fail(t, "timed out waiting for blocked readers")
+	}
 }
 
 func TestBuffer(t *testing.T) {
@@ -121,6 +132,9 @@ func TestShortBuffer(t *testing.T) {
 	n, err := buffer.WriteTo([]byte{0, 1, 2, 3}, addr)
 	assert.NoError(t, err)
 	equalInt(t, 4, n)
+	n, err = buffer.WriteTo([]byte{4, 5, 6}, addr)
+	assert.NoError(t, err)
+	equalInt(t, 3, n)
 
 	// Try to read with a short buffer.
 	packet := make([]byte, 3)
@@ -129,6 +143,12 @@ func TestShortBuffer(t *testing.T) {
 	assert.ErrorIs(t, err, io.ErrShortBuffer)
 	equalUDPAddr(t, nil, raddr)
 	equalInt(t, 0, n)
+
+	n, raddr, err = buffer.ReadFrom(packet)
+	assert.NoError(t, err)
+	equalUDPAddr(t, addr, raddr)
+	equalInt(t, 3, n)
+	assert.Equal(t, []byte{4, 5, 6}, packet)
 
 	// Close.
 	assert.NoError(t, buffer.Close())
@@ -180,7 +200,102 @@ func TestResizeWraparound(t *testing.T) {
 	}
 }
 
+func TestResizeRechecksCapacityAfterAcquiringReadLock(t *testing.T) {
+	buffer := NewPacketBuffer()
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5684}
+
+	_, err := buffer.WriteTo([]byte{1}, addr)
+	assert.NoError(t, err)
+
+	buffer.readLock.Lock()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := buffer.WriteTo([]byte{2}, addr)
+		writeDone <- writeErr
+	}()
+
+	if !assert.Eventually(t, func() bool {
+		if !buffer.writeLock.TryLock() {
+			return true
+		}
+		buffer.writeLock.Unlock()
+
+		return false
+	}, time.Second, time.Millisecond) {
+		buffer.readLock.Unlock()
+
+		return
+	}
+
+	buffer.read.Add(1)
+	buffer.readLock.Unlock()
+
+	select {
+	case err = <-writeDone:
+		assert.NoError(t, err)
+	case <-time.After(time.Second):
+		assert.Fail(t, "timed out waiting for writer to return")
+
+		return
+	}
+
+	equalInt(t, 1, len(buffer.packets))
+
+	packet := make([]byte, 1)
+	n, _, err := buffer.ReadFrom(packet)
+	assert.NoError(t, err)
+	equalInt(t, 1, n)
+	equalBytes(t, []byte{2}, packet[:n])
+}
+
 func TestWraparound(t *testing.T) {
+	buffer := NewPacketBufferWithSize(4)
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:5684")
+	assert.NoError(t, err)
+
+	// Write multiple.
+	n, err := buffer.WriteTo([]byte{0, 1, 2, 3}, addr)
+	assert.NoError(t, err)
+	equalInt(t, 4, n)
+
+	n, err = buffer.WriteTo([]byte{4, 5}, addr)
+	assert.NoError(t, err)
+	equalInt(t, 2, n)
+
+	n, err = buffer.WriteTo([]byte{6, 7, 8}, addr)
+	assert.NoError(t, err)
+	equalInt(t, 3, n)
+
+	// Read once.
+	packet := make([]byte, 4)
+	var raddr net.Addr
+	n, raddr, err = buffer.ReadFrom(packet)
+	assert.NoError(t, err)
+	equalInt(t, 4, n)
+	equalBytes(t, []byte{0, 1, 2, 3}, packet[:n])
+	equalUDPAddr(t, addr, raddr)
+
+	// Write again.
+	n, err = buffer.WriteTo([]byte{9, 10, 11}, addr)
+	assert.NoError(t, err)
+	equalInt(t, 3, n)
+
+	// Write again and verify buffer did not grew.
+	n, err = buffer.WriteTo([]byte{12, 13, 14, 15, 16, 17, 18, 19}, addr)
+	assert.NoError(t, err)
+	equalInt(t, 8, n)
+	equalInt(t, 4, len(buffer.packets))
+
+	// Write again and verify packet dropped.
+	_, err = buffer.WriteTo([]byte{12, 13, 14, 15, 16, 17, 18, 19}, addr)
+	assert.Error(t, err)
+	equalInt(t, 4, len(buffer.packets))
+
+	// Close.
+	assert.NoError(t, buffer.Close())
+}
+
+func TestWraparoundUnbounded(t *testing.T) {
 	buffer := NewPacketBuffer()
 	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:5684")
 	assert.NoError(t, err)
@@ -203,7 +318,6 @@ func TestWraparound(t *testing.T) {
 	// Packet 2: buffer doubles from 1 to 2.
 	// Packet 3: buffer doubles from 2 to 4.
 	equalInt(t, 4, len(buffer.packets))
-
 	// Read once.
 	packet := make([]byte, 4)
 	var raddr net.Addr
@@ -279,6 +393,84 @@ func TestBufferAsync(t *testing.T) {
 	assert.False(t, ok, routineFail)
 }
 
+func TestBufferCloseUnblocksAllReaders(t *testing.T) {
+	const readerCount = 4
+
+	buffer := NewPacketBuffer()
+	started := make(chan struct{}, readerCount)
+	results := make(chan error, readerCount)
+
+	for range readerCount {
+		go func() {
+			started <- struct{}{}
+			_, _, err := buffer.ReadFrom(make([]byte, 1))
+			results <- err
+		}()
+	}
+
+	for range readerCount {
+		<-started
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	assert.NoError(t, buffer.Close())
+
+	for range readerCount {
+		select {
+		case err := <-results:
+			assert.ErrorIs(t, err, io.EOF)
+		case <-time.After(time.Second):
+			assert.Fail(t, "timed out waiting for blocked reader to return")
+
+			return
+		}
+	}
+}
+
+func TestBufferWritesUnblockAllReaders(t *testing.T) {
+	const readerCount = 4
+	for _, test := range []struct {
+		name    string
+		payload []byte
+		wantErr error
+	}{
+		{name: "complete", payload: []byte{1}},
+		{name: "short buffer", payload: []byte{1, 2}, wantErr: io.ErrShortBuffer},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			buffer := NewPacketBuffer()
+			defer func() { assert.NoError(t, buffer.Close()) }()
+
+			addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5684}
+			results := make(chan error, readerCount)
+			for range readerCount {
+				go func() {
+					_, _, err := buffer.ReadFrom(make([]byte, 1))
+					results <- err
+				}()
+			}
+
+			waitForBlockedReaders(t, buffer, readerCount)
+			// Each reader consumes one datagram, even with a short buffer.
+			for range readerCount {
+				_, err := buffer.WriteTo(test.payload, addr)
+				assert.NoError(t, err)
+			}
+
+			for range readerCount {
+				select {
+				case err := <-results:
+					assert.ErrorIs(t, err, test.wantErr)
+				case <-time.After(time.Second):
+					assert.Fail(t, "timed out waiting for blocked reader to return")
+
+					return
+				}
+			}
+		})
+	}
+}
+
 func benchmarkBufferWR(b *testing.B, size int64, write bool, grow int) { // nolint:unparam
 	b.Helper()
 
@@ -347,10 +539,14 @@ func BenchmarkBufferWWR1400(b *testing.B) {
 func benchmarkBuffer(b *testing.B, size int64) {
 	b.Helper()
 
+	if runtime.GOARCH == "386" {
+		b.Skip("skip memory-intensive benchmark on 32-bit")
+	}
+
 	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:5684")
 	assert.NoError(b, err)
 
-	buffer := NewPacketBuffer()
+	buffer := NewPacketBufferWithSize(b.N)
 	b.SetBytes(size)
 
 	done := make(chan struct{})
@@ -426,23 +622,12 @@ func FuzzPacketBuffer_WriteReadRoundTrip(f *testing.F) {
 			rb := make([]byte, int(readCap))
 			n, raddr, errRead := buf.ReadFrom(rb)
 
-			if len(expect) == 0 {
-				if len(rb) == 0 {
-					assert.NoError(t, errRead)
-					assert.Equal(t, 0, n)
-					assert.NotNil(t, raddr)
-					assert.Equal(t, addr.String(), raddr.String())
-				} else {
-					assert.ErrorIs(t, errRead, io.EOF)
-					assert.Equal(t, 0, n)
-				}
+			if len(expect) > len(rb) {
+				assert.ErrorIs(t, errRead, io.ErrShortBuffer)
+				assert.Equal(t, 0, n)
+				assert.Nil(t, raddr)
 
 				return
-			}
-
-			if errors.Is(errRead, io.ErrShortBuffer) {
-				rb = make([]byte, len(expect))
-				n, raddr, errRead = buf.ReadFrom(rb)
 			}
 
 			assert.NoError(t, errRead)
@@ -488,22 +673,27 @@ func FuzzPacketBuffer_DeadlineAndShortBuffer(f *testing.F) {
 		n, err = buf.WriteTo(payload, ua)
 		assert.NoError(t, err)
 		assert.Equal(t, len(payload), n)
+		n, err = buf.WriteTo([]byte{0x7f}, ua)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, n)
 
 		n, addr, err = buf.ReadFrom(rb)
-		if errors.Is(err, io.ErrShortBuffer) {
-			rb = make([]byte, len(payload))
-			n, addr, err = buf.ReadFrom(rb)
-		}
-
-		assert.NoError(t, err)
-		assert.Equal(t, len(payload), n)
-		assert.Equal(t, payload, rb[:n])
-
-		if addr != nil {
-			assert.Equal(t, ua.String(), addr.String())
+		if len(payload) > len(rb) {
+			assert.ErrorIs(t, err, io.ErrShortBuffer)
+			assert.Equal(t, 0, n)
+			assert.Nil(t, addr)
 		} else {
+			assert.NoError(t, err)
+			assert.Equal(t, len(payload), n)
+			assert.Equal(t, payload, rb[:n])
 			assert.NotNil(t, addr)
+			assert.Equal(t, ua.String(), addr.String())
 		}
+
+		n, addr, err = buf.ReadFrom(make([]byte, 1))
+		assert.NoError(t, err)
+		assert.Equal(t, 1, n)
+		assert.Equal(t, ua.String(), addr.String())
 	})
 }
 

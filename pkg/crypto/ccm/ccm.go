@@ -21,7 +21,7 @@ import (
 	"encoding/binary"
 	"math"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 )
 
 // ccm represents a Counter with CBC-MAC with a specific key.
@@ -60,7 +60,7 @@ func NewCCM(b cipher.Block, tagsize, noncesize int) (CCM, error) {
 	if lensize < 2 || lensize > 8 {
 		return nil, dtlserrors.ErrCCMInvalidNonceSize
 	}
-	c := &ccm{b: b, M: uint8(tagsize), L: uint8(lensize)} //nolint:gosec // G114
+	c := &ccm{b: b, M: uint8(tagsize), L: uint8(lensize)}
 
 	return c, nil
 }
@@ -74,11 +74,11 @@ func maxlen(l uint8, tagsize int) int {
 	if m64 := uint64(math.MaxInt64) - uint64(tagsize); l > 8 || mLen > m64 { //nolint:gosec // G114
 		mLen = m64 // The maximum lentgh on a 64bit arch
 	}
-	if mLen != uint64(int(mLen)) { //nolint:gosec // G114
+	if mLen != uint64(int(mLen)) {
 		return math.MaxInt32 - tagsize // We have only 32bit int's
 	}
 
-	return int(mLen) //nolint:gosec // G114
+	return int(mLen)
 }
 
 // MaxNonceLength returns the maximum nonce length for a given plaintext length.
@@ -87,7 +87,7 @@ func maxlen(l uint8, tagsize int) int {
 func MaxNonceLength(pdatalen int) int {
 	const tagsize = 16
 	for L := 2; L <= 8; L++ {
-		if maxlen(uint8(L), tagsize) >= pdatalen { //nolint:gosec // G115
+		if maxlen(uint8(L), tagsize) >= pdatalen {
 			return 15 - L
 		}
 	}
@@ -135,18 +135,21 @@ func (c *ccm) tag(nonce, plaintext, adata []byte) ([]byte, error) {
 	var block [ccmBlockSize]byte
 	if adataLength := uint64(len(adata)); adataLength > 0 { //nolint:nestif
 		// First adata block includes adata length
+		// RFC 3610 section 2.2, NIST SP 800-38C A.2.2: lengths of 0xff00 and
+		// above are marked with 0xff 0xfe (4-byte length) or 0xff 0xff
+		// (8-byte length).
 		i := 2
-		if adataLength <= 0xfeff {
+		switch {
+		case adataLength <= 0xfeff:
 			binary.BigEndian.PutUint16(block[:i], uint16(adataLength))
-		} else {
-			binary.BigEndian.PutUint16(block[0:2], 0xfeff)
-			if adataLength < uint64(1<<32) {
-				i = 2 + 4
-				binary.BigEndian.PutUint32(block[2:i], uint32(adataLength)) //nolint:gosec // G115
-			} else {
-				i = 2 + 8
-				binary.BigEndian.PutUint64(block[2:i], adataLength)
-			}
+		case adataLength < uint64(1<<32):
+			binary.BigEndian.PutUint16(block[0:2], 0xfffe)
+			i = 2 + 4
+			binary.BigEndian.PutUint32(block[2:i], uint32(adataLength))
+		default:
+			binary.BigEndian.PutUint16(block[0:2], 0xffff)
+			i = 2 + 8
+			binary.BigEndian.PutUint64(block[2:i], adataLength)
 		}
 		i = copy(block[i:], adata)
 		c.cbcRound(mac[:], block[:])

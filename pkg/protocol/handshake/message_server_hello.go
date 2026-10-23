@@ -4,11 +4,14 @@
 package handshake
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/pkg/protocol"
-	"github.com/pion/dtls/v3/pkg/protocol/extension"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/pkg/protocol"
+	"github.com/pion/dtls/v4/pkg/protocol/alert"
+	"github.com/pion/dtls/v4/pkg/protocol/extension"
 )
 
 // MessageServerHello is sent in response to a ClientHello
@@ -25,7 +28,7 @@ type MessageServerHello struct {
 
 	CipherSuiteID     *uint16
 	CompressionMethod *protocol.CompressionMethod
-	Extensions        []extension.Extension
+	Extensions        []extension.Value
 }
 
 const messageServerHelloVariableWidthStart = 2 + RandomLength
@@ -35,47 +38,102 @@ func (m MessageServerHello) Type() Type {
 	return TypeServerHello
 }
 
+// MarshalSize returns the size required by MarshalTo.
+func (m *MessageServerHello) MarshalSize() int {
+	total := 0
+	total += extension.MarshalListSize(m.Extensions)
+	total += messageServerHelloVariableWidthStart + 1 + len(m.SessionID) + 2 + 1
+
+	return total
+}
+
 // Marshal encodes the Handshake.
 func (m *MessageServerHello) Marshal() ([]byte, error) {
-	switch {
-	case m.CipherSuiteID == nil:
-		return nil, dtlserrors.ErrCipherSuiteUnset
-	case m.CompressionMethod == nil:
-		return nil, dtlserrors.ErrCompressionMethodUnset
-	case len(m.SessionID) > 255:
-		return nil, dtlserrors.ErrSessionIDTooLong
-	}
-
-	extensions, err := extension.Marshal(m.Extensions)
+	prepared, err := m.prepareMarshal()
 	if err != nil {
 		return nil, err
 	}
 
-	out := make([]byte, 0, messageServerHelloVariableWidthStart+1+len(m.SessionID)+2+1+len(extensions))
-	out = append(out, m.Version.Major, m.Version.Minor)
+	out := make([]byte, prepared.size)
+	m.marshalTo(out, prepared.extensions)
+
+	return out, nil
+}
+
+// MarshalTo encodes the Handshake into a pre-allocated buffer.
+func (m *MessageServerHello) MarshalTo(out []byte) (int, error) {
+	prepared, err := m.prepareMarshal()
+	if err != nil {
+		return 0, err
+	}
+	if len(out) < prepared.size {
+		return 0, dtlserrors.ErrBufferTooSmall
+	}
+
+	m.marshalTo(out, prepared.extensions)
+
+	return prepared.size, nil
+}
+
+type preparedServerHello struct {
+	extensions extension.PreparedList
+	size       int
+}
+
+func (m *MessageServerHello) prepareMarshal() (preparedServerHello, error) {
+	switch {
+	case m.CipherSuiteID == nil:
+		return preparedServerHello{}, dtlserrors.ErrCipherSuiteUnset
+	case m.CompressionMethod == nil:
+		return preparedServerHello{}, dtlserrors.ErrCompressionMethodUnset
+	case len(m.SessionID) > 255:
+		return preparedServerHello{}, dtlserrors.ErrSessionIDTooLong
+	}
+
+	extensions, err := extension.PrepareList(m.Extensions)
+	size := messageServerHelloVariableWidthStart + 1 + len(m.SessionID) + 2 + 1 + extensions.MarshalSize()
+	prepared := preparedServerHello{extensions: extensions, size: size}
+	if size < 0 {
+		return prepared, dtlserrors.ErrLengthMismatch
+	}
+	if err != nil {
+		return prepared, err
+	}
+
+	return prepared, nil
+}
+
+func (m *MessageServerHello) marshalTo(out []byte, extensions extension.PreparedList) {
+	offset := 0
+	out[0] = m.Version.Major()
+	out[1] = m.Version.Minor()
+	offset += 2
 
 	rand := m.Random.MarshalFixed()
-	out = append(out, rand[:]...)
+	n := copy(out[offset:], rand[:])
+	offset += n
 
-	out = append(out, byte(len(m.SessionID))) //nolint:gosec // G115: session ID length is validated to be <= 255 above.
-	out = append(out, m.SessionID...)
+	out[offset] = byte(len(m.SessionID)) //nolint:gosec // G115
+	offset += 1
+	n = copy(out[offset:], m.SessionID)
+	offset += n
 
-	out = append(out, 0x00, 0x00)
-	binary.BigEndian.PutUint16(out[len(out)-2:], *m.CipherSuiteID)
+	binary.BigEndian.PutUint16(out[offset:], *m.CipherSuiteID)
+	offset += 2
 
-	out = append(out, byte(m.CompressionMethod.ID))
+	out[offset] = byte(m.CompressionMethod.ID)
+	offset += 1
 
-	return append(out, extensions...), nil
+	_, _ = extensions.MarshalTo(out[offset:])
 }
 
 // Unmarshal populates the message from encoded data.
-func (m *MessageServerHello) Unmarshal(data []byte) error {
+func (m *MessageServerHello) Unmarshal(data []byte) error { //nolint:cyclop
 	if len(data) < 2+RandomLength {
 		return dtlserrors.ErrBufferTooSmall
 	}
 
-	m.Version.Major = data[0]
-	m.Version.Minor = data[1]
+	m.Version = protocol.VersionFromBytes(data[0], data[1])
 
 	var random [RandomLength]byte
 	copy(random[:], data[2:])
@@ -91,7 +149,7 @@ func (m *MessageServerHello) Unmarshal(data []byte) error {
 	if len(data) <= currOffset+n {
 		return dtlserrors.ErrBufferTooSmall
 	}
-	m.SessionID = append([]byte{}, data[currOffset:currOffset+n]...)
+	m.SessionID = bytes.Clone(data[currOffset : currOffset+n])
 	currOffset += len(m.SessionID)
 
 	if len(data) < currOffset+2 {
@@ -112,12 +170,28 @@ func (m *MessageServerHello) Unmarshal(data []byte) error {
 	}
 
 	if len(data) <= currOffset {
-		m.Extensions = []extension.Extension{}
+		context := serverHelloExtensionContext(m.Random, nil)
+		extensions, err := decodeRawExtensions(nil, context)
+		if err != nil {
+			return err
+		}
+		m.Extensions = extensions
 
 		return nil
 	}
 
-	extensions, err := extension.Unmarshal(data[currOffset:])
+	rawExtensions, err := extension.ParseList(data[currOffset:])
+	if err != nil {
+		context := extensionContextServerHello12
+		randomBytes := m.Random.MarshalFixed()
+		if bytes.Equal(randomBytes[:], HelloRetryRequestRandom()) {
+			context = extensionContextHelloRetryRequest
+		}
+
+		return fmt.Errorf("extensions in %s: %w: %w", context, err, &alert.Alert{Level: alert.Fatal, Description: alert.DecodeError})
+	}
+	context := serverHelloExtensionContext(m.Random, rawExtensions)
+	extensions, err := decodeRawExtensions(rawExtensions, context)
 	if err != nil {
 		return err
 	}

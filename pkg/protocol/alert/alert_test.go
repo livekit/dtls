@@ -6,7 +6,7 @@ package alert
 import (
 	"testing"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -44,4 +44,9 @@ func TestAlert(t *testing.T) {
 		assert.NoError(t, marshalErr)
 		assert.Equal(t, test.Data, data)
 	}
+}
+
+func TestCertificateRequiredDescription(t *testing.T) {
+	assert.Equal(t, Description(116), CertificateRequired)
+	assert.Equal(t, "CertificateRequired", CertificateRequired.String())
 }

@@ -6,75 +6,8 @@ package extension
 import (
 	"slices"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"golang.org/x/crypto/cryptobyte"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
 )
-
-// ALPN is a TLS extension for application-layer protocol negotiation within
-// the TLS handshake.
-//
-// https://tools.ietf.org/html/rfc7301
-type ALPN struct {
-	ProtocolNameList []string
-}
-
-// TypeValue returns the extension TypeValue.
-func (a ALPN) TypeValue() TypeValue {
-	return ALPNTypeValue
-}
-
-// Marshal encodes the extension.
-func (a *ALPN) Marshal() ([]byte, error) {
-	var builder cryptobyte.Builder
-	builder.AddUint16(uint16(a.TypeValue()))
-	builder.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
-		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
-			for _, proto := range a.ProtocolNameList {
-				p := proto // Satisfy range scope lint
-				b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
-					b.AddBytes([]byte(p))
-				})
-			}
-		})
-	})
-
-	return builder.Bytes()
-}
-
-// Unmarshal populates the extension from encoded data.
-func (a *ALPN) Unmarshal(data []byte) error {
-	val := cryptobyte.String(data)
-
-	var extension uint16
-	val.ReadUint16(&extension)
-	if TypeValue(extension) != a.TypeValue() {
-		return dtlserrors.ErrInvalidExtensionType
-	}
-
-	var extData cryptobyte.String
-	if !val.ReadUint16LengthPrefixed(&extData) {
-		return dtlserrors.ErrLengthMismatch
-	}
-
-	var protoList cryptobyte.String
-	if !extData.ReadUint16LengthPrefixed(&protoList) || protoList.Empty() {
-		return ErrALPNInvalidFormat
-	}
-
-	if !extData.Empty() {
-		return dtlserrors.ErrLengthMismatch
-	}
-
-	for !protoList.Empty() {
-		var proto cryptobyte.String
-		if !protoList.ReadUint8LengthPrefixed(&proto) || proto.Empty() {
-			return ErrALPNInvalidFormat
-		}
-		a.ProtocolNameList = append(a.ProtocolNameList, string(proto))
-	}
-
-	return nil
-}
 
 // ALPNProtocolSelection negotiates a shared protocol according to #3.2 of rfc7301.
 func ALPNProtocolSelection(supportedProtocols, peerSupportedProtocols []string) (string, error) {

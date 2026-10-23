@@ -7,8 +7,8 @@ package alert
 import (
 	"fmt"
 
-	dtlserrors "github.com/pion/dtls/v3/internal/errors"
-	"github.com/pion/dtls/v3/pkg/protocol"
+	dtlserrors "github.com/pion/dtls/v4/internal/errors"
+	"github.com/pion/dtls/v4/pkg/protocol"
 )
 
 // Level is the level of the TLS Alert.
@@ -54,6 +54,7 @@ const (
 	AccessDenied           Description = 49
 	DecodeError            Description = 50
 	DecryptError           Description = 51
+	TooManyCIDsRequested   Description = 52
 	ExportRestriction      Description = 60
 	ProtocolVersion        Description = 70
 	InsufficientSecurity   Description = 71
@@ -62,7 +63,9 @@ const (
 	NoRenegotiation        Description = 100
 	MissingExtension       Description = 109
 	UnsupportedExtension   Description = 110
+	CertificateRequired    Description = 116
 	NoApplicationProtocol  Description = 120
+	ECHRequired            Description = 121
 )
 
 func (d Description) String() string { //nolint:cyclop
@@ -103,6 +106,8 @@ func (d Description) String() string { //nolint:cyclop
 		return "DecodeError"
 	case DecryptError:
 		return "DecryptError"
+	case TooManyCIDsRequested:
+		return "TooManyCIDsRequested"
 	case ExportRestriction:
 		return "ExportRestriction"
 	case ProtocolVersion:
@@ -119,6 +124,10 @@ func (d Description) String() string { //nolint:cyclop
 		return "MissingExtension"
 	case UnsupportedExtension:
 		return "UnsupportedExtension"
+	case CertificateRequired:
+		return "CertificateRequired"
+	case ECHRequired:
+		return "ECHRequired"
 	case NoApplicationProtocol:
 		return "NoApplicationProtocol"
 	default:
@@ -136,19 +145,40 @@ func (d Description) String() string { //nolint:cyclop
 // connections.  Like other messages, alert messages are encrypted and
 // compressed, as specified by the current connection state.
 // https://tools.ietf.org/html/rfc5246#section-7.2
+//
+//nolint:errname // Alert is the protocol-defined name.
 type Alert struct {
 	Level       Level
 	Description Description
 }
 
+// MarshalSize returns the minimal buffer size required for MarshalTo.
+func (a Alert) MarshalSize() int {
+	return 2
+}
+
 // ContentType returns the ContentType of this Content.
-func (a Alert) ContentType() protocol.ContentType {
+func (a *Alert) ContentType() protocol.ContentType {
 	return protocol.ContentTypeAlert
 }
 
 // Marshal returns the encoded alert.
 func (a *Alert) Marshal() ([]byte, error) {
-	return []byte{byte(a.Level), byte(a.Description)}, nil
+	out := make([]byte, a.MarshalSize())
+	_, err := a.MarshalTo(out)
+
+	return out, err
+}
+
+// MarshalTo returns the encoded alert.
+func (a *Alert) MarshalTo(out []byte) (int, error) {
+	if len(out) < a.MarshalSize() {
+		return 0, dtlserrors.ErrBufferTooSmall
+	}
+	out[0] = byte(a.Level)
+	out[1] = byte(a.Description)
+
+	return 2, nil
 }
 
 // Unmarshal populates the alert from binary data.
@@ -166,3 +196,6 @@ func (a *Alert) Unmarshal(data []byte) error {
 func (a *Alert) String() string {
 	return fmt.Sprintf("Alert %s: %s", a.Level, a.Description)
 }
+
+// Error allows alerts to be used in standard Go error chains.
+func (a *Alert) Error() string { return a.String() }

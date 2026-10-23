@@ -7,7 +7,8 @@ import (
 	"crypto/tls"
 	"testing"
 
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	dtlsconfig "github.com/pion/dtls/v4/internal/config"
+	"github.com/pion/dtls/v4/pkg/crypto/selfsign"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -28,63 +29,28 @@ func TestGetCertificate(t *testing.T) {
 		expectedCertificate tls.Certificate
 		getCertificate      func(info *ClientHelloInfo) (*tls.Certificate, error)
 	}{
-		{
-			desc: "Simple match in CN",
-			localCertificates: []tls.Certificate{
-				certificateRandom,
-				certificateTest,
-				certificateWildcard,
-			},
-			serverName:          "test.test",
-			expectedCertificate: certificateTest,
-		},
-		{
-			desc: "Simple match in SANs",
-			localCertificates: []tls.Certificate{
-				certificateRandom,
-				certificateTest,
-				certificateWildcard,
-			},
-			serverName:          "www.test.test",
-			expectedCertificate: certificateTest,
-		},
+		{desc: "Simple match in CN", localCertificates: []tls.Certificate{certificateRandom, certificateTest, certificateWildcard}, serverName: "test.test", expectedCertificate: certificateTest},
+		{desc: "Simple match in SANs", localCertificates: []tls.Certificate{certificateRandom, certificateTest, certificateWildcard}, serverName: "www.test.test", expectedCertificate: certificateTest},
 
-		{
-			desc: "Wildcard match",
-			localCertificates: []tls.Certificate{
-				certificateRandom,
-				certificateTest,
-				certificateWildcard,
-			},
-			serverName:          "foo.test.test",
-			expectedCertificate: certificateWildcard,
-		},
-		{
-			desc: "No match return first",
-			localCertificates: []tls.Certificate{
-				certificateRandom,
-				certificateTest,
-				certificateWildcard,
-			},
-			serverName:          "foo.bar",
-			expectedCertificate: certificateRandom,
-		},
-		{
-			desc: "Get certificate from callback",
-			getCertificate: func(*ClientHelloInfo) (*tls.Certificate, error) {
-				return &certificateTest, nil
-			},
-			expectedCertificate: certificateTest,
-		},
+		{desc: "Wildcard match", localCertificates: []tls.Certificate{certificateRandom, certificateTest, certificateWildcard}, serverName: "foo.test.test", expectedCertificate: certificateWildcard},
+		{desc: "No match return first", localCertificates: []tls.Certificate{certificateRandom, certificateTest, certificateWildcard}, serverName: "foo.bar", expectedCertificate: certificateRandom},
+		{desc: "Get certificate from callback", getCertificate: func(*ClientHelloInfo) (*tls.Certificate, error) { return &certificateTest, nil }, expectedCertificate: certificateTest},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.desc, func(t *testing.T) {
-			cfg := &handshakeConfig{
-				localCertificates:   test.localCertificates,
-				localGetCertificate: test.getCertificate,
+			getCertificate := func(info *dtlsconfig.ClientHelloInfo) (*tls.Certificate, error) {
+				return test.getCertificate(&ClientHelloInfo{ServerName: info.ServerName, CipherSuites: info.CipherSuites, RandomBytes: info.RandomBytes})
 			}
-			cert, err := cfg.getCertificate(&ClientHelloInfo{ServerName: test.serverName})
+			if test.getCertificate == nil {
+				getCertificate = nil
+			}
+
+			cfg := &dtlsconfig.HandshakeConfig{
+				LocalCertificates:   test.localCertificates,
+				LocalGetCertificate: getCertificate,
+			}
+			cert, err := cfg.GetCertificate(&dtlsconfig.ClientHelloInfo{ServerName: test.serverName})
 			assert.NoError(t, err)
 			assert.Equal(t, test.expectedCertificate.Leaf, cert.Leaf, "Certificate Leaf should match expected")
 		})
